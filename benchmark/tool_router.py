@@ -157,6 +157,13 @@ class TFIDFIndex:
 # 路由器主体(三级漏斗的第 ② 级粗筛)
 # ---------------------------------------------------------------------------
 
+# 只读/查询类工具前缀。企业任务几乎总是"先查后写"(resolve 实体再操作),
+# 而任务文本只描述实体、往往不含 "find/list/get" 这类动词词面 —— 实测约
+# 1/4 的必要工具因此得 0 分落榜。给这类工具一个小的排序地板分(通用启发式,
+# 不读任何任务标注,无答案泄露),precision 换 recall,符合"宁多勿少"原则。
+LOOKUP_PREFIXES = ("find_", "list_", "get_", "search_", "retrieve_", "check_")
+LOOKUP_FLOOR = 0.08
+
 
 class ToolRouter:
     """TF-IDF 粗筛路由。route() 返回 (子集工具列表, 元数据)。"""
@@ -177,20 +184,26 @@ class ToolRouter:
         self.min_score = min_score
 
     def route(self, task_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        hits = self.index.search(task_text, top_k=self.k_candidate)
-        if not hits or hits[0][0] < self.min_score:
+        # 先在全池上打分(地板分要作用于全池,0 分 lookup 才有机会入选)
+        raw = self.index.search(task_text, top_k=len(self.tools))
+        if not raw or raw[0][0] < self.min_score:
             # ⑤ 置信度回退:语义差异过大,回退全量(执行不至于全灭)
             return self.tools, {
                 "fallback": "low_confidence",
-                "top_score": hits[0][0] if hits else 0.0,
+                "top_score": raw[0][0] if raw else 0.0,
                 "subset_size": len(self.tools),
             }
+        # 只读工具地板分 + 取候选
+        boosted = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n)
+                   for s, n in raw]
+        boosted.sort(reverse=True)
+        hits = boosted[: self.k_candidate]
         subset = [self.by_name[n] for _, n in hits[: self.k_final]]
         return subset, {
             "candidate_size": len(hits),
             "candidate_names": [n for _, n in hits],  # ③ 精排的候选池(≤30)
             "subset_size": len(subset),
-            "top_score": hits[0][0],
+            "top_score": raw[0][0],
             "bottom_score": hits[min(self.k_final, len(hits)) - 1][0],
         }
 

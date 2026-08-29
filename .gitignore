@@ -14,6 +14,7 @@ logs/
 
 # Databases / archives (restore via gym_dbs.zip, see README)
 gym_dbs/
+Domain Wise DBs and Task-DB Mappings/
 *.db
 
 # Environment / secrets

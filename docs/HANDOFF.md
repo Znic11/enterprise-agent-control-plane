@@ -5,6 +5,54 @@
 
 ---
 
+## ⚡ 2026-08-29 执行记录(P0 完成情况,先读这里)
+
+### 已完成
+1. **git 基线建立**:仓库已初始化,两个 commit:
+   - `9f3edb4` Baseline(统一前状态,含重复路由器)
+   - `6f1ff39` Unify tool router(统一后,见下)
+2. **路由器统一完成**(原 2.2 节的结构问题已解决):
+   - **唯一实现 = `benchmark/tool_router.py`**:TF-IDF 粗筛(k_candidate=30)→ 可选 LLM 精排(注入 `llm_call_fn`,provider 无关)→ 两层兜底(置信度低→回退全量;LLM 失败/选中<5→回退 TF-IDF 子集)。
+   - Tokenizer 修复:snake_case 拆分后**过滤停用词与 <3 长度 token**(否则 `post_to_feed` 靠 "to" 虚词冲进 rank 2)+ **保守复数词干化**(`entitlements→entitlement`)。
+   - **只读工具地板分**(`LOOKUP_FLOOR=0.08`):任务文本只写实体不写 "find/list",约 1/4 必要查找工具得 0 分落榜;给 `find_/list_/get_/search_/retrieve_/check_` 前缀工具小地板分(通用启发式,不读 selected_tools,无泄露)。
+   - `orchestrators/react_router.py` 已改 import 统一模块;`orchestrators/tool_router.py` 与 `scripts/eval_router_offline.py` 已删除(git rm)。
+   - **唯一评估入口 = `eval_router.py`**:`--pool_mode domain|cross`、`--tools tools_dump.json`(真实池)。
+3. **离线评估已跑通**(13 任务本地小样本,名字近似池):
+
+   | 指标 | 统一前 | 统一后(tokenizer 修复+地板分) |
+   |---|---|---|
+   | micro recall@20 | 52.5% | **63.7%**(macro 67.6%) |
+   | micro precision@20 | 33.2% | 40.3% |
+   | itsm 单任务 | 100% full coverage | 100% |
+
+   ⚠️ **数字口径**:池 = 域内 selected_tools 并集 + 7 个干扰工具,**工具只有名字没有真实 description**(近似池,双向失真)。跨域池(cross 模拟)recall 基本持平 63.7%。
+4. **依赖已安装**:`uv sync --extra openai`(langchain_core 可用,react_router 注册链可 import)。
+
+### 遇到的坑(重要)
+- **F 盘路径异常再次出现**:`git rm` 两个文件时 `orchestrators/` 下其余 5 个文件从工作区消失(git 索引完好),用 `git checkout -- <files>` 恢复。**在 F 盘上批量文件操作后必须 `ls` 核对**。
+- Docker Desktop 已装但 daemon 启动失败/被拒(静默退出),本次未能 dump 真实工具池。
+
+### 剩余缺口与下一步(按序)
+1. **【阻塞:需 LLM key】端到端对照**(P0-4 未做):`conf/llm/` 不存在。用户配好 key 后:
+   ```bash
+   unzip gym_dbs.zip   # 已解压,可跳过
+   docker pull shivakrishnareddyma225/enterpriseops-gym-mcp-teams:latest
+   docker run -d -p 8002:8002 shivakrishnareddyma225/enterpriseops-gym-mcp-teams:latest
+   cp -r conf.example conf && vi conf/llm/my-model.json
+   # baseline
+   python evaluate.py --hf_dataset ServiceNow-AI/EnterpriseOps-Gym --domain teams --mode oracle \
+       --llm_config conf/llm/my-model.json --orchestrator react --output_folder results/react/<model>/teams/oracle --num_runs 1
+   # router 版(同模型同 split 同 concurrency,只改 orchestrator)
+   python evaluate.py --hf_dataset ServiceNow-AI/EnterpriseOps-Gym --domain teams --mode oracle \
+       --llm_config conf/llm/my-model.json --orchestrator react_router --router_top_k 20 \
+       --output_folder results/react_router/<model>/teams/oracle --num_runs 1
+   ```
+2. **dump 真实工具池,重跑离线评估**(起 docker 后,MCP `tools/list` 结果存 `tools_dump.json`,然后 `python eval_router.py --tools tools_dump.json`):真实 description 下 recall 预期显著高于 63.7%(词面缺口会被描述补上),这是**口径修正**,旧数字别写简历。
+3. recall 若仍 <90%:候选保留率不足 → 上调 `router_top_k` 或上 LLM 精排;漏检模式分析脚本在本会话历史(全池打分 + GT 标记)。
+4. 之后进入 Phase 2(verifier-in-the-loop,见 agent_design_plan.md 3.2)。
+
+---
+
 ## 0. 交接摘要(三句话)
 
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研一个"企业级"LLM Agent,用可复现实验证明其有效性,作为实习简历的核心项目。
