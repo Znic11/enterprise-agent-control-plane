@@ -26,7 +26,7 @@
    | itsm 单任务 | 100% full coverage | 100% |
 
    ⚠️ **数字口径**:池 = 域内 selected_tools 并集 + 7 个干扰工具,**工具只有名字没有真实 description**(近似池,双向失真)。跨域池(cross 模拟)recall 基本持平 63.7%。
-4. **依赖已安装**:`uv sync --extra openai`(langchain_core 可用,react_router 注册链可 import)。
+4. **依赖未装成**:`uv sync --extra openai` 运行 23 分钟无任何产物(.venv 未创建),疑似网络/代理被墙,已终止。**离线评估不受影响**(路由器纯 stdlib)。待网络恢复后重试 `uv sync --extra openai`,完成后验证 `python -c "import evaluate; print(evaluate.ORCHESTRATOR_MAP)"`。
 
 ### 遇到的坑(重要)
 - **F 盘路径异常再次出现**:`git rm` 两个文件时 `orchestrators/` 下其余 5 个文件从工作区消失(git 索引完好),用 `git checkout -- <files>` 恢复。**在 F 盘上批量文件操作后必须 `ls` 核对**。
