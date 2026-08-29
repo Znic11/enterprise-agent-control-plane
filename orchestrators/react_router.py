@@ -5,10 +5,10 @@ capabilities the stock ReAct agent lacks:
 
 1. TOOL ROUTING
    Before execution starts, the full tool set (up to ~512 tools) is reduced to
-   a top-k subset using ``orchestrators.tool_router``. Keyword routing is free
-   and deterministic; optional LLM routing uses a cheap router model when
-   ``router_llm_client`` is provided. The subset is logged so every run is
-   auditable.
+   a top-k subset using ``benchmark.tool_router`` (unified module): TF-IDF
+   coarse filter, optional LLM rerank over the top-30 candidates when
+   ``router_llm_client`` is provided, and graceful fallbacks. The subset is
+   logged so every run is auditable.
 
 2. PROGRESSIVE DISCOVERY
    If the executing LLM calls a tool that was NOT in the routed subset (a
@@ -39,7 +39,7 @@ from benchmark.llm_client import LLMClient, get_text_content
 from benchmark.models import BenchmarkConfig
 
 from .base import AgentOrchestrator
-from .tool_router import route, RouteResult
+from benchmark.tool_router import route, RouteResult
 
 logger = logging.getLogger(__name__)
 

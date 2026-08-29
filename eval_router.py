@@ -1,25 +1,41 @@
-"""离线评估脚本:用任务自带的 selected_tools 标注评估 ToolRouter 质量。
+"""离线评估脚本(统一版):用任务自带的 selected_tools 标注评估工具路由质量。
 
 用法(项目根目录):
     python eval_router.py [--data_dir data/revised] [--top_k 20]
+    python eval_router.py --pool_mode cross          # 模拟 512 工具跨域全池
+    python eval_router.py --tools tools_dump.json    # 真实全量工具池(gym dump)
+
+本脚本是 eval_router.py(TF-IDF 版)与 scripts/eval_router_offline.py(关键词版)
+合并后的唯一评估入口,调用统一路由器 benchmark.tool_router.route()(即
+react_router orchestrator 执行时用的同一入口,不带 LLM 精排)。
+
+指标:
+    recall@k       = |routed ∩ selected| / |selected|     ← 生死线,目标 ≥ 0.9
+    precision@k    = |routed ∩ selected| / |routed|       ← 0.5-0.7 即可(宁多勿少)
+    full coverage  = selected ⊆ routed(一次路由即可,无需渐进式扩展)
+    exposed tools  = |routed|(token 成本代理)
 
 ⚠️ 诚实性边界:selected_tools 仅用于【评估路由质量】,执行时路由器只输入
 user_prompt,禁止读取该字段(否则等于答案泄露)。
 
-⚠️ 近似池说明:本地 data/revised 只有少量任务,域工具池由该域所有任务的
-selected_tools 并集近似(偏小、数字偏乐观)。真实数字需要连 MCP server
-dump 全量工具池后替换(见文档 4.4)。
+⚠️ 近似池说明(未提供 --tools 时):本地 data/revised 只有少量任务,域工具池由
+该域所有任务的 selected_tools 并集 + 少量干扰工具近似(池偏小、数字偏乐观)。
+真实数字需连 MCP server dump 全量工具池后用 --tools 传入(见 docs/tool_router_design.md 4.4)。
 """
+
+from __future__ import annotations
 
 import argparse
 import glob
 import json
 import os
+import sys
 from collections import defaultdict
+from typing import Any, Dict, List
 
-from benchmark.tool_router import ToolRouter, build_tool_signature
+from benchmark.tool_router import route
 
-# 工具池里注入的"干扰工具"(来自其他域的典型企业工具名,仅用于 smoke test 逼真度)
+# 干扰工具(来自其他域的典型企业工具,注入域内池以增加逼真度;仅 name-only 池用)
 NOISE_TOOLS = [
     {"name": "send_email_message", "description": "Send an email message to a recipient.", "input_schema": {"properties": {"to": {}, "subject": {}, "body": {}}}},
     {"name": "schedule_meeting", "description": "Schedule a meeting in the calendar with attendees.", "input_schema": {"properties": {"start": {}, "end": {}, "attendees": {}}}},
@@ -31,26 +47,34 @@ NOISE_TOOLS = [
 ]
 
 
-def load_tasks(data_dir: str):
+def load_tasks(data_dir: str) -> List[Dict[str, Any]]:
     tasks = []
     for path in sorted(glob.glob(os.path.join(data_dir, "**", "*.json"), recursive=True)):
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
         domain = os.path.basename(os.path.dirname(path))
-        selected = d.get("selected_tools") or []
+        gym = [g.get("mcp_server_name") for g in (d.get("gym_servers_config") or [])]
         tasks.append({
-            "path": path,
+            "id": os.path.basename(path),
             "domain": domain,
+            "gym": gym,
             "user_prompt": d.get("user_prompt", ""),
-            "selected_tools": set(selected),
-            "gym": [g.get("mcp_server_name") for g in (d.get("gym_servers_config") or [])],
+            "selected_tools": set(d.get("selected_tools") or []),
         })
     return tasks
 
 
-def build_domain_pool(tasks, domain: str) -> list:
-    """近似工具池 = 该域所有任务 selected_tools 的并集 + 干扰工具。"""
-    pool_names = set()
+def load_real_tools(tools_path: str) -> List[Dict[str, Any]]:
+    with open(tools_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "tools" in data:
+        data = data["tools"]
+    return [t for t in data if isinstance(t, dict) and t.get("name")]
+
+
+def build_domain_pool(tasks: List[Dict[str, Any]], domain: str) -> List[Dict[str, Any]]:
+    """近似域工具池 = 该域所有任务 selected_tools 的并集 + 干扰工具。"""
+    pool_names: set = set()
     for t in tasks:
         if t["domain"] == domain:
             pool_names |= t["selected_tools"]
@@ -60,65 +84,111 @@ def build_domain_pool(tasks, domain: str) -> list:
     return pool
 
 
-def evaluate(tasks, top_k: int):
-    print(f"{'domain':<8} {'tasks':>5} {'recall@k':>9} {'precision@k':>12} {'pool':>5} {'fallback':>9}")
-    print("-" * 60)
-    agg = defaultdict(lambda: {"tp": 0, "n_sel": 0, "n_pred": 0, "fallbacks": 0, "count": 0})
-
-    for domain in sorted({t["domain"] for t in tasks}):
-        dom_tasks = [t for t in tasks if t["domain"] == domain]
-        pool = build_domain_pool(tasks, domain)
-        router = ToolRouter(pool, k_candidate=30, k_final=top_k)
-
-        tp = n_sel = n_pred = fallbacks = 0
-        for t in dom_tasks:
-            subset, meta = router.route(t["user_prompt"])
-            pred = {s["name"] for s in subset}
-            tp += len(pred & t["selected_tools"])
-            n_sel += len(t["selected_tools"])
-            n_pred += len(pred)
-            if meta.get("fallback"):
-                fallbacks += 1
-
-        recall = tp / n_sel * 100 if n_sel else 0
-        precision = tp / n_pred * 100 if n_pred else 0
-        print(f"{domain:<8} {len(dom_tasks):>5} {recall:>8.1f}% {precision:>11.1f}% {len(pool):>5} {fallbacks:>9}")
-        a = agg["ALL"]
-        a["tp"] += tp; a["n_sel"] += n_sel; a["n_pred"] += n_pred
-        a["fallbacks"] += fallbacks; a["count"] += len(dom_tasks)
-
-    a = agg["ALL"]
-    print("-" * 60)
-    print(f"{'ALL':<8} {a['count']:>5} {a['tp']/a['n_sel']*100:>8.1f}% {a['tp']/a['n_pred']*100:>11.1f}% {'-':>5} {a['fallbacks']:>9}")
-    print(f"\n目标:recall@k >= 90%(漏一个工具任务即失败);precision@k 0.5-0.7 即可(宁多勿少)")
+def build_cross_pool(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """近似跨域全池 = 所有域 selected_tools 并集(模拟 512 工具空间)。"""
+    pool_names = sorted({n for t in tasks for n in t["selected_tools"]})
+    return [{"name": n, "description": n.replace("_", " "), "input_schema": {"properties": {}}}
+            for n in pool_names]
 
 
-def main():
-    ap = argparse.ArgumentParser()
+def evaluate(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
+    per_task_rows = []
+    dom_agg = defaultdict(lambda: {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0})
+    all_agg = {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0}
+
+    for t in tasks:
+        pool = pools[t["domain"]]
+        result = route(t["user_prompt"], pool, top_k=top_k)
+        pred = set(result.selected)
+        oracle = t["selected_tools"]
+        tp = len(pred & oracle)
+        recall = tp / len(oracle) if oracle else 0.0
+        precision = tp / len(pred) if pred else 0.0
+        full = 1 if oracle and oracle <= pred else 0
+
+        print(f"{t['domain']:<8} {t['id'][:28]:<28} |{len(oracle):>3} |{len(pred):>3} | "
+              f"recall={recall:>6.1%} precision={precision:>6.1%} "
+              f"full={'Y' if full else '-'} fb={result.fallback or '-'}")
+
+        a = dom_agg[t["domain"]]
+        for agg in (a, all_agg):
+            agg["tp"] += tp
+            agg["n_sel"] += len(oracle)
+            agg["n_pred"] += len(pred)
+            agg["full"] += full
+            agg["fb"] += 1 if result.fallback else 0
+            agg["n"] += 1
+            agg["exposed"] += len(pred)
+        per_task_rows.append((t["domain"], recall, full))
+
+    print("\n=== 汇总(micro:所有任务工具级合计)===")
+    print(f"{'domain':<8}{'n':>4}{'recall@k':>10}{'precision@k':>13}{'full_cov':>10}{'exposed':>9}{'fallback':>10}")
+    print("-" * 66)
+    for dom, a in sorted(dom_agg.items()):
+        _print_agg_row(dom, a, top_k)
+    _print_agg_row("ALL", all_agg, top_k)
+
+    macro = sum(r for _, r, _ in per_task_rows) / len(per_task_rows) if per_task_rows else 0
+    print(f"\nmacro recall@{top_k}(按任务平均): {macro:.1%}")
+    print(f"目标:recall@{top_k} >= 90%(漏一个工具任务即败;渐进式扩展会兜底到 1.0)")
+    print(f"     precision@{top_k} 0.5-0.7 即可(宁多勿少);full_cov 越高,渐进式扩展触发越少")
+
+
+def _print_agg_row(label: str, a: Dict[str, float], top_k: int) -> None:
+    recall = a["tp"] / a["n_sel"] * 100 if a["n_sel"] else 0
+    precision = a["tp"] / a["n_pred"] * 100 if a["n_pred"] else 0
+    full = a["full"] / a["n"] * 100 if a["n"] else 0
+    exposed = a["exposed"] / a["n"] if a["n"] else 0
+    print(f"{label:<8}{int(a['n']):>4}{recall:>9.1f}%{precision:>12.1f}%{full:>9.1f}%{exposed:>9.1f}{int(a['fb']):>10}")
+
+
+def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
+    """打印第一个任务的路由明细,便于人工核对漏检。"""
+    t = tasks[0]
+    result = route(t["user_prompt"], pools[t["domain"]], top_k=top_k)
+    pred = set(result.selected)
+    miss = t["selected_tools"] - pred
+    print("=== 样例路由核对 ===")
+    print(f"任务: {t['user_prompt'][:140]}...")
+    print(f"ground truth({len(t['selected_tools'])}): {sorted(t['selected_tools'])}")
+    print(f"预测({len(pred)}, method={result.method}): {sorted(pred)}")
+    print(f"漏检: {sorted(miss) if miss else '无'}")
+    print(f"meta: {result.to_metadata()}\n")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Offline tool router evaluation (unified)")
     ap.add_argument("--data_dir", default="data/revised")
     ap.add_argument("--top_k", type=int, default=20)
+    ap.add_argument("--pool_mode", choices=["domain", "cross"], default="domain",
+                    help="domain=每域独立池(默认,贴近生产);cross=跨域合并池(模拟无域锁定的 512 工具空间)")
+    ap.add_argument("--tools", default=None,
+                    help="真实全量工具池 JSON(list[{name, description, input_schema}]);提供时忽略近似池")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
     if not tasks:
         print(f"未找到任务: {args.data_dir}")
-        return
+        sys.exit(1)
 
-    # 打印一个路由样例,便于人工核对
-    sample = tasks[0]
-    pool = build_domain_pool(tasks, sample["domain"])
-    router = ToolRouter(pool, k_candidate=30, k_final=args.top_k)
-    subset, meta = router.route(sample["user_prompt"])
-    print("=== 样例路由核对 ===")
-    print(f"任务: {sample['user_prompt'][:120]}...")
-    print(f"ground truth({len(sample['selected_tools'])}): {sorted(sample['selected_tools'])}")
-    pred = {s['name'] for s in subset}
-    miss = sample['selected_tools'] - pred
-    print(f"预测({len(pred)}): {sorted(pred)}")
-    print(f"漏检(未进 top-{args.top_k}): {sorted(miss) if miss else '无'}")
-    print(f"meta: {meta}\n")
+    if args.tools:
+        real = load_real_tools(args.tools)
+        print(f"使用真实全量工具池: {len(real)} tools")
+        pools = {d: real for d in {t["domain"] for t in tasks}}
+    elif args.pool_mode == "cross":
+        pool = build_cross_pool(tasks)
+        print(f"使用近似跨域全池: {len(pool)} tools(pool_mode=cross)")
+        pools = {d: pool for d in {t["domain"] for t in tasks}}
+    else:
+        pools = {d: build_domain_pool(tasks, d) for d in {t["domain"] for t in tasks}}
+        print("使用近似域内池(pool_mode=domain): " +
+              ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
+    print(f"共 {len(tasks)} 任务, top_k={args.top_k}\n")
 
-    evaluate(tasks, args.top_k)
+    print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
+    print("-" * 96)
+    inspect_sample(tasks, pools, args.top_k)
+    evaluate(tasks, pools, args.top_k)
 
 
 if __name__ == "__main__":

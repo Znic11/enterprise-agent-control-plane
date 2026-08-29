@@ -1,17 +1,47 @@
-"""ToolRouter v1: 纯 NumPy 实现的 TF-IDF + 余弦相似度粗筛,零额外依赖。
+"""ToolRouter — 统一工具路由模块(Phase 1)。
 
-设计见 docs/tool_router_design.md(三级漏斗的第 ② 级,BM25 版)。
-V2 升级点:把 TFIDFIndex 换成 sentence-transformers embedding 余弦,接口不变。
+本模块合并了此前两套重复实现(见 docs/HANDOFF.md 2.2):
+  * benchmark/tool_router.py   —— TF-IDF 粗筛(类 API,主路径,保留)
+  * orchestrators/tool_router.py —— 关键词 + LLM 路由(函数 API,已并入)
+
+统一后的三级漏斗(docs/tool_router_design.md):
+  ② 粗筛   TF-IDF 余弦 top-30(k_candidate),置信度低于 min_score 回退全量(⑤)
+  ③ 精排   可选轻量 LLM 在候选集内重选(注入 llm_call_fn,provider 无关);
+            解析失败 / 选中 <5 个 → 回退 TF-IDF 子集
+  兜底     route_keywords(纯关键词重叠,零成本,只在 TF-IDF 完全失效时作为
+           最后手段,也供离线消融对比)
 
 用法:
-    router = ToolRouter(tools)            # tools: List[{"name","description","input_schema"}]
+    # orchestrator 内(推荐,索引只建一次)
+    router = ToolRouter(tools)
     subset, meta = router.route(task_text)
+
+    # 便捷函数(每次调用即建索引;512 工具量级下开销可忽略)
+    result = route(task_text, tools, top_k=20, llm_call_fn=fn, prefer_llm=True)
+    result.selected   # List[str] 工具名
+    result.to_metadata()
+
+诚实性边界:route() 只接受任务文本与工具定义,不读取任务配置的
+selected_tools 字段(那是离线评估用的 ground truth,执行时读=答案泄露)。
+
+V2 升级点:把 TFIDFIndex 换成 sentence-transformers embedding 余弦,接口不变。
 """
 
+from __future__ import annotations
+
+import json
+import logging
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TOP_K = 20
+DEFAULT_K_CANDIDATE = 30
+MIN_LLM_SELECTED = 5  # LLM 精排选中数低于此值 → 回退粗筛子集(宁多勿少)
 
 
 # ---------------------------------------------------------------------------
@@ -19,14 +49,57 @@ from typing import Any, Dict, List, Tuple
 # ---------------------------------------------------------------------------
 
 
+def _stem(w: str) -> str:
+    """轻量词干化(纯规则,零依赖):归一复数,弥补 TF-IDF 词汇不匹配。
+
+    entitlements -> entitlement, products -> product, entries -> entry。
+    只做保守的复数归一(不做 es/ing 剥离,避免 updates->updat vs update
+    这类不对称);长度阈值防止过度剥离(case/sla/status 不受影响)。
+    """
+    if len(w) <= 4:
+        return w
+    if w.endswith("ies") and len(w) > 5:
+        return w[:-3] + "y"
+    if w.endswith("sses"):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith(("ss", "us", "is", "ses")):
+        return w[:-1]
+    return w
+
+
 def _tokenize(text: str) -> List[str]:
-    """粗粒度 tokenize:小写 + 拆分 snake_case + 按非字母数字切分。"""
+    """TF-IDF tokenize:小写 + 拆分 snake_case + 去停用词/短词 + 轻量词干化。
+
+    停用词与 >=3 长度过滤必须做:snake_case 拆分会把 post_to_feed 拆出 "to",
+    不滤的话虚词会把无关工具顶进 top-k(实测 rank 2)。
+    """
     text = (text or "").lower()
     text = re.sub(r"[^a-z0-9_]+", " ", text)
     toks: List[str] = []
     for w in text.split():
         toks.extend(w.split("_"))  # create_new_case -> create, new, case
-    return [t for t in toks if len(t) > 1]
+    return [_stem(t) for t in toks if len(t) >= 3 and t not in STOPWORDS]
+
+
+# 语法虚词,对关键词路由无信号。注意保留企业实体/动作名词(case, record,
+# create, update, find, ...)—— 它们正是工具名的构成成分。
+STOPWORDS = {
+    "the", "a", "an", "to", "of", "for", "on", "in", "with", "and", "or",
+    "is", "are", "be", "by", "at", "from", "as", "it", "this", "that",
+    "their", "them", "they", "his", "her", "using", "please", "need",
+    "needs", "must", "should", "via", "all", "any", "each", "per", "not",
+    "no", "do", "does", "make", "sure", "more", "than", "then", "will",
+    "would", "can", "could", "may", "might", "also", "into", "over",
+    "under", "between", "within", "about", "after", "before", "during",
+    "until", "while", "out", "up", "down", "off", "some", "such", "only",
+    "very", "just", "one", "two", "user", "customer",
+}
+
+
+def keyword_tokenize(text: str) -> List[str]:
+    """关键词路由 tokenize:去停用词、丢短 token、复数归一。"""
+    words = re.split(r"[^a-zA-Z0-9]+", (text or "").lower())
+    return [_stem(w) for w in words if w and w not in STOPWORDS and len(w) >= 3]
 
 
 def build_tool_signature(tool: Dict[str, Any]) -> str:
@@ -43,7 +116,7 @@ def build_tool_signature(tool: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TF-IDF 检索索引(不依赖 sklearn / rank_bm25)
+# TF-IDF 检索索引(纯 stdlib,零第三方依赖)
 # ---------------------------------------------------------------------------
 
 
@@ -81,7 +154,7 @@ class TFIDFIndex:
 
 
 # ---------------------------------------------------------------------------
-# 路由器(三级漏斗的第 ② 级;第 ③ 级精排、④⑤ 兜底见文档)
+# 路由器主体(三级漏斗的第 ② 级粗筛)
 # ---------------------------------------------------------------------------
 
 
@@ -91,8 +164,8 @@ class ToolRouter:
     def __init__(
         self,
         tools: List[Dict[str, Any]],
-        k_candidate: int = 30,
-        k_final: int = 20,
+        k_candidate: int = DEFAULT_K_CANDIDATE,
+        k_final: int = DEFAULT_TOP_K,
         min_score: float = 0.05,
     ):
         self.tools = tools
@@ -106,7 +179,7 @@ class ToolRouter:
     def route(self, task_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         hits = self.index.search(task_text, top_k=self.k_candidate)
         if not hits or hits[0][0] < self.min_score:
-            # ⑤ 置信度回退:语义差异过大,回退全量
+            # ⑤ 置信度回退:语义差异过大,回退全量(执行不至于全灭)
             return self.tools, {
                 "fallback": "low_confidence",
                 "top_score": hits[0][0] if hits else 0.0,
@@ -115,15 +188,210 @@ class ToolRouter:
         subset = [self.by_name[n] for _, n in hits[: self.k_final]]
         return subset, {
             "candidate_size": len(hits),
+            "candidate_names": [n for _, n in hits],  # ③ 精排的候选池(≤30)
             "subset_size": len(subset),
             "top_score": hits[0][0],
             "bottom_score": hits[min(self.k_final, len(hits)) - 1][0],
         }
 
 
-def expand_tool(tool_name: str, full_pool: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+def expand_tool(tool_name: str, full_pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """④ 渐进式扩展:执行中请求子集外工具时,从全量池取 schema。"""
     for t in full_pool:
         if t["name"] == tool_name:
             return t
     return None
+
+
+# ---------------------------------------------------------------------------
+# 关键词路由(零成本兜底,也供离线消融对比)
+# ---------------------------------------------------------------------------
+
+
+def keyword_score(tool: Dict[str, Any], task_tokens: set) -> float:
+    """工具名/description 与任务 token 的重叠度。工具名权重×2(最强信号)。"""
+    name_tokens = set(keyword_tokenize(tool.get("name", "")))
+    desc_tokens = set(keyword_tokenize(tool.get("description", "")))
+    name_hits = len(name_tokens & task_tokens)
+    desc_hits = len(desc_tokens & task_tokens)
+    return 2.0 * name_hits + 0.8 * desc_hits
+
+
+def route_keywords(
+    task_text: str,
+    all_tools: List[Dict[str, Any]],
+    top_k: int = DEFAULT_TOP_K,
+) -> List[str]:
+    """纯关键词重叠路由(零成本、确定性)。"""
+    task_tokens = set(keyword_tokenize(task_text))
+    if not task_tokens or not all_tools:
+        return []
+    scored = sorted(all_tools, key=lambda t: keyword_score(t, task_tokens), reverse=True)
+    hits = [t["name"] for t in scored if keyword_score(t, task_tokens) > 0]
+    return hits[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# LLM 精排(三级漏斗的第 ③ 级;llm_call_fn 由调用方注入,provider 无关)
+# ---------------------------------------------------------------------------
+
+ROUTER_PROMPT = """You are a tool router for an enterprise agent. Given a user task and a list of candidate tools, select the tools needed to complete the task.
+
+Rules:
+- Select tools you would actually call for this task, including read-only lookups.
+- When unsure, prefer INCLUDING a tool over missing it (a missing tool fails the task; an extra one only adds noise).
+- Return ONLY a JSON array of tool names, no explanation, no markdown.
+
+Task:
+{task}
+
+Candidate tools:
+{tools}
+
+Return: ["tool_a", "tool_b", ...]"""
+
+
+def parse_llm_route_response(text: str) -> Optional[List[str]]:
+    """尽力从 LLM 路由响应中提取工具名列表。"""
+    if not text:
+        return None
+    # 1. 顶层 JSON 数组
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list):
+            return [str(x) for x in data]
+    except json.JSONDecodeError:
+        pass
+    # 2. 文本中的 [...] 块
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except json.JSONDecodeError:
+            pass
+    # 3. 任意位置的带引号字符串
+    names = re.findall(r'"([^"]+)"', text)
+    return names or None
+
+
+def route_llm(
+    task_text: str,
+    candidate_tools: List[Dict[str, Any]],
+    llm_call_fn: Callable[[str], str],
+    top_k: int = DEFAULT_TOP_K,
+) -> Optional[List[str]]:
+    """LLM 在候选集内精排。失败/解析不出返回 None(由上层决定回退)。
+
+    ``llm_call_fn(prompt) -> str`` 由调用方注入;本模块不依赖任何 LLM SDK。
+    """
+    lines = []
+    for tool in candidate_tools:
+        name = str(tool.get("name", ""))
+        desc = str(tool.get("description", "")).replace("\n", " ")[:120]
+        lines.append(f"- {name}: {desc}")
+    prompt = ROUTER_PROMPT.format(task=task_text, tools="\n".join(lines))
+    try:
+        raw = llm_call_fn(prompt)
+    except Exception as e:  # noqa: BLE001 — 路由绝不能崩掉整个 run
+        logger.warning(f"LLM router call failed ({e})")
+        return None
+    names = parse_llm_route_response(raw)
+    if names is None:
+        logger.warning("LLM router returned unparseable output")
+        return None
+    valid = {str(t.get("name")) for t in candidate_tools}
+    return [n for n in names if n in valid][:top_k]
+
+
+# ---------------------------------------------------------------------------
+# 统一入口 + 审计元数据
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RouteResult:
+    """一次路由的结果 + 诊断信息(供审计与实验归因)。"""
+
+    selected: List[str] = field(default_factory=list)
+    method: str = "tfidf"  # "tfidf" | "tfidf+llm" | "full_fallback" | "empty"
+    full_tool_count: int = 0
+    task_text: str = ""
+    candidate_size: int = 0
+    top_score: float = 0.0
+    fallback: Optional[str] = None
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {
+            "router_method": self.method,
+            "router_selected_count": len(self.selected),
+            "router_selected": self.selected,
+            "router_full_tool_count": self.full_tool_count,
+            "router_candidate_size": self.candidate_size,
+            "router_top_score": round(self.top_score, 4),
+            "router_fallback": self.fallback,
+        }
+
+
+def route(
+    task_text: str,
+    all_tools: List[Dict[str, Any]],
+    top_k: int = DEFAULT_TOP_K,
+    llm_call_fn: Optional[Callable[[str], str]] = None,
+    prefer_llm: bool = False,
+) -> RouteResult:
+    """统一路由入口:TF-IDF 粗筛 →(可选)LLM 精排 → 兜底。
+
+    - 粗筛置信度低 → 回退全量工具(method="full_fallback")
+    - prefer_llm 且提供了 llm_call_fn → 在粗筛候选(≤30)上 LLM 精排;
+      LLM 失败或选中 <5 个 → 回退粗筛 top-k 子集
+    - 工具池为空 → selected=[],method="empty"(上层应视为配置错误)
+    """
+    if not all_tools:
+        logger.warning("route() called with an empty tool pool")
+        return RouteResult(selected=[], method="empty", full_tool_count=0, task_text=task_text)
+
+    router = ToolRouter(all_tools, k_candidate=max(DEFAULT_K_CANDIDATE, top_k), k_final=top_k)
+    subset, meta = router.route(task_text)
+    top_score = meta.get("top_score", 0.0)
+
+    if meta.get("fallback"):
+        names = [t["name"] for t in all_tools]
+        logger.warning(
+            f"[ROUTER] low confidence (top_score={top_score:.4f} < {router.min_score}); "
+            f"falling back to full pool ({len(names)} tools)"
+        )
+        return RouteResult(
+            selected=names,
+            method="full_fallback",
+            full_tool_count=len(all_tools),
+            task_text=task_text,
+            top_score=top_score,
+            fallback=meta["fallback"],
+        )
+
+    method = "tfidf"
+    if prefer_llm and llm_call_fn is not None:
+        cand_names = meta.get("candidate_names") or [t["name"] for t in subset]
+        cand_tools = [router.by_name[n] for n in cand_names if n in router.by_name]
+        llm_names = route_llm(task_text, cand_tools, llm_call_fn, top_k)
+        if llm_names is None:
+            logger.warning("[ROUTER] LLM rerank failed; keeping TF-IDF subset")
+        elif len(llm_names) < MIN_LLM_SELECTED:
+            logger.warning(
+                f"[ROUTER] LLM selected only {len(llm_names)} tools (<{MIN_LLM_SELECTED}); "
+                f"keeping TF-IDF subset"
+            )
+        else:
+            subset = [router.by_name[n] for n in llm_names if n in router.by_name]
+            method = "tfidf+llm"
+
+    return RouteResult(
+        selected=[t["name"] for t in subset],
+        method=method,
+        full_tool_count=len(all_tools),
+        task_text=task_text,
+        candidate_size=meta.get("candidate_size", len(subset)),
+        top_score=top_score,
+    )
