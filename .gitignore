@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Runtime artifacts (regenerable; large result files not tracked at baseline)
+results/
+logs/
+*.log
+
+# Databases / archives (restore via gym_dbs.zip, see README)
+gym_dbs/
+*.db
+
+# Environment / secrets
+.env
+conf/llm/*.local.json
+
+# WorkBuddy session data
+.workbuddy/
+
+# IDE
+.idea/
+.vscode/
