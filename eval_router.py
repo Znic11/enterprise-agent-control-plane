@@ -4,10 +4,14 @@
     python eval_router.py [--data_dir data/revised] [--top_k 20]
     python eval_router.py --pool_mode cross          # 模拟 512 工具跨域全池
     python eval_router.py --tools tools_dump.json    # 真实全量工具池(gym dump)
+    python eval_router.py --llm_config conf/llm/mini.json
+                                                     # 同一轮跑『粗筛』vs『粗筛+LLM精排』
+                                                     # 两组消融对照(需 langchain 依赖与 key;
+                                                     # 不需要 docker MCP server)
 
 本脚本是 eval_router.py(TF-IDF 版)与 scripts/eval_router_offline.py(关键词版)
 合并后的唯一评估入口,调用统一路由器 benchmark.tool_router.route()(即
-react_router orchestrator 执行时用的同一入口,不带 LLM 精排)。
+react_router orchestrator 执行时用的同一入口)。
 
 指标:
     recall@k       = |routed ∩ selected| / |selected|     ← 生死线,目标 ≥ 0.9
@@ -91,24 +95,35 @@ def build_cross_pool(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for n in pool_names]
 
 
-def evaluate(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
-    per_task_rows = []
+def _eval_one_variant(
+    tasks: List[Dict[str, Any]],
+    pools: Dict[str, List[Dict[str, Any]]],
+    top_k: int,
+    llm_call_fn=None,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, float]]:
+    """对全部任务跑一遍指定路由配置,返回 {domain, ALL} 聚合指标。"""
     dom_agg = defaultdict(lambda: {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0})
     all_agg = {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0}
+    macro_sum = 0.0
 
     for t in tasks:
         pool = pools[t["domain"]]
-        result = route(t["user_prompt"], pool, top_k=top_k)
+        result = route(t["user_prompt"], pool, top_k=top_k, llm_call_fn=llm_call_fn,
+                       prefer_llm=llm_call_fn is not None)
         pred = set(result.selected)
         oracle = t["selected_tools"]
         tp = len(pred & oracle)
         recall = tp / len(oracle) if oracle else 0.0
         precision = tp / len(pred) if pred else 0.0
         full = 1 if oracle and oracle <= pred else 0
+        macro_sum += recall
 
-        print(f"{t['domain']:<8} {t['id'][:28]:<28} |{len(oracle):>3} |{len(pred):>3} | "
-              f"recall={recall:>6.1%} precision={precision:>6.1%} "
-              f"full={'Y' if full else '-'} fb={result.fallback or '-'}")
+        if verbose:
+            print(f"{t['domain']:<8} {t['id'][:28]:<28} |{len(oracle):>3} |{len(pred):>3} | "
+                  f"recall={recall:>6.1%} precision={precision:>6.1%} "
+                  f"full={'Y' if full else '-'} fb={result.fallback or '-'} "
+                  f"method={result.method}")
 
         a = dom_agg[t["domain"]]
         for agg in (a, all_agg):
@@ -119,18 +134,51 @@ def evaluate(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]]
             agg["fb"] += 1 if result.fallback else 0
             agg["n"] += 1
             agg["exposed"] += len(pred)
-        per_task_rows.append((t["domain"], recall, full))
 
-    print("\n=== 汇总(micro:所有任务工具级合计)===")
+    all_agg["macro"] = macro_sum / len(tasks) if tasks else 0.0
+    return {**{d: dict(a) for d, a in dom_agg.items()}, "ALL": all_agg}
+
+
+def print_variant(name: str, agg: Dict[str, Dict[str, float]], top_k: int, verbose: bool) -> None:
+    print(f"\n=== [{name}] 汇总(micro:所有任务工具级合计)===")
     print(f"{'domain':<8}{'n':>4}{'recall@k':>10}{'precision@k':>13}{'full_cov':>10}{'exposed':>9}{'fallback':>10}")
     print("-" * 66)
-    for dom, a in sorted(dom_agg.items()):
-        _print_agg_row(dom, a, top_k)
-    _print_agg_row("ALL", all_agg, top_k)
+    rows = [(d, a) for d, a in agg.items() if d != "ALL"]
+    if verbose:
+        for dom, a in sorted(rows):
+            _print_agg_row(dom, a, top_k)
+    _print_agg_row("ALL", agg["ALL"], top_k)
+    print(f"macro recall@{top_k}(按任务平均): {agg['ALL']['macro']:.1%}")
 
-    macro = sum(r for _, r, _ in per_task_rows) / len(per_task_rows) if per_task_rows else 0
-    print(f"\nmacro recall@{top_k}(按任务平均): {macro:.1%}")
-    print(f"目标:recall@{top_k} >= 90%(漏一个工具任务即败;渐进式扩展会兜底到 1.0)")
+
+def evaluate(
+    tasks: List[Dict[str, Any]],
+    pools: Dict[str, List[Dict[str, Any]]],
+    top_k: int,
+    llm_call_fn=None,
+) -> None:
+    """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_call_fn 时只跑粗筛)。"""
+    variants = [("TF-IDF 粗筛", None)]
+    if llm_call_fn is not None:
+        variants.append(("粗筛 + LLM 精排", llm_call_fn))
+
+    verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
+    results = {}
+    for name, fn in variants:
+        if fn is None:
+            print(f"\n{'#' * 66}\n# 变体: {name}\n{'#' * 66}")
+        results[name] = _eval_one_variant(tasks, pools, top_k, llm_call_fn=fn, verbose=verbose)
+        print_variant(name, results[name], top_k, verbose)
+
+    if len(results) == 2:
+        (n1, a1), (n2, a2) = results.items()
+        d_r = a2["ALL"]["tp"] / a2["ALL"]["n_sel"] - a1["ALL"]["tp"] / a1["ALL"]["n_sel"]
+        d_p = a2["ALL"]["tp"] / a2["ALL"]["n_pred"] - a1["ALL"]["tp"] / a1["ALL"]["n_pred"]
+        print(f"\n=== 消融对照 ===")
+        print(f"  recall@{top_k}: {a1['ALL']['tp']/a1['ALL']['n_sel']:.1%} -> {a2['ALL']['tp']/a2['ALL']['n_sel']:.1%} ({d_r:+.1%})")
+        print(f"  precision@{top_k}: {a1['ALL']['tp']/a1['ALL']['n_pred']:.1%} -> {a2['ALL']['tp']/a2['ALL']['n_pred']:.1%} ({d_p:+.1%})")
+
+    print(f"\n目标:recall@{top_k} >= 90%(漏一个工具任务即败;渐进式扩展会兜底到 1.0)")
     print(f"     precision@{top_k} 0.5-0.7 即可(宁多勿少);full_cov 越高,渐进式扩展触发越少")
 
 
@@ -156,6 +204,41 @@ def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, 
     print(f"meta: {result.to_metadata()}\n")
 
 
+def build_llm_call_fn(llm_config_path: str):
+    """从 LLM 配置文件(conf/llm/<name>.json,与 evaluate.py 同格式)构建
+    llm_call_fn(prompt) -> str。懒导入:未传 --llm_config 时不加载 langchain。
+
+    ⚠️ 诚实性边界:LLM 精排的输入只有任务文本与候选工具名/描述,
+    绝不读取 selected_tools —— 该字段只在这里用作评分 ground truth。
+    """
+    import asyncio
+
+    from benchmark.llm_client import LLMClient, get_text_content
+    from benchmark_utils import load_llm_configs
+    from langchain_core.messages import HumanMessage
+
+    cfg = load_llm_configs(llm_config_path)[0]
+    client = LLMClient(
+        provider=cfg.llm_provider,
+        model=cfg.llm_model,
+        api_key=cfg.llm_api_key,
+        api_endpoint=cfg.llm_api_endpoint,
+        api_version=cfg.llm_api_version,
+        region=cfg.llm_region,
+        temperature=cfg.temperature,
+        max_tokens=cfg.max_tokens,
+        top_p=cfg.top_p,
+        effort=cfg.effort,
+        reasoning=cfg.reasoning,
+    )
+
+    def llm_call(prompt: str) -> str:
+        resp = asyncio.run(client.llm.ainvoke([HumanMessage(content=prompt)]))
+        return get_text_content(resp.content)
+
+    return llm_call
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Offline tool router evaluation (unified)")
     ap.add_argument("--data_dir", default="data/revised")
@@ -164,6 +247,9 @@ def main() -> None:
                     help="domain=每域独立池(默认,贴近生产);cross=跨域合并池(模拟无域锁定的 512 工具空间)")
     ap.add_argument("--tools", default=None,
                     help="真实全量工具池 JSON(list[{name, description, input_schema}]);提供时忽略近似池")
+    ap.add_argument("--llm_config", default=None,
+                    help="LLM 配置 JSON(conf/llm/<name>.json 同格式);提供时同时评估"
+                         "『粗筛』与『粗筛+LLM精排』两组并输出消融对照。需 langchain 依赖。")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
@@ -185,10 +271,15 @@ def main() -> None:
               ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
     print(f"共 {len(tasks)} 任务, top_k={args.top_k}\n")
 
+    llm_call_fn = None
+    if args.llm_config:
+        llm_call_fn = build_llm_call_fn(args.llm_config)
+        print(f"已启用 LLM 精排(router LLM: {args.llm_config}),将与纯粗筛做消融对照\n")
+
     print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
     print("-" * 96)
     inspect_sample(tasks, pools, args.top_k)
-    evaluate(tasks, pools, args.top_k)
+    evaluate(tasks, pools, args.top_k, llm_call_fn=llm_call_fn)
 
 
 if __name__ == "__main__":
