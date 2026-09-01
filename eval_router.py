@@ -30,14 +30,16 @@ user_prompt,禁止读取该字段(否则等于答案泄露)。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import glob
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from typing import Any, Dict, List
 
-from benchmark.tool_router import route
+from benchmark.tool_router import batch_route, route
 
 # 干扰工具(来自其他域的典型企业工具,注入域内池以增加逼真度;仅 name-only 池用)
 NOISE_TOOLS = [
@@ -99,18 +101,37 @@ def _eval_one_variant(
     tasks: List[Dict[str, Any]],
     pools: Dict[str, List[Dict[str, Any]]],
     top_k: int,
-    llm_call_fn=None,
+    llm_call_async=None,
+    concurrency: int = 8,
     verbose: bool = True,
 ) -> Dict[str, Dict[str, float]]:
-    """对全部任务跑一遍指定路由配置,返回 {domain, ALL} 聚合指标。"""
+    """对全部任务跑一遍指定路由配置(batch_route:索引建一次+LLM 并发),
+    返回 {domain, ALL} 聚合指标。"""
+    # 按域分组(域模式各域池不同;batch_route 的语义与 route() 逐任务一致)
+    dom_texts: Dict[str, List[str]] = defaultdict(list)
+    for t in tasks:
+        dom_texts[t["domain"]].append(t["user_prompt"])
+
+    results_by_prompt: Dict[str, Any] = {}
+    for dom, texts in dom_texts.items():
+        last = [0]
+        def _progress(i: int, n: int, dom=dom):
+            print(f"\r  [{dom}] LLM 精排 {i}/{n} ", end="", flush=True)
+        pairs = asyncio.run(batch_route(
+            texts, pools[dom], top_k=top_k,
+            llm_call_fn_async=llm_call_async, concurrency=concurrency,
+            progress_fn=_progress if llm_call_async else None,
+        ))
+        if llm_call_async:
+            print()
+        results_by_prompt.update(pairs)
+
     dom_agg = defaultdict(lambda: {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0})
     all_agg = {"tp": 0, "n_sel": 0, "n_pred": 0, "full": 0, "fb": 0, "n": 0, "exposed": 0}
     macro_sum = 0.0
 
     for t in tasks:
-        pool = pools[t["domain"]]
-        result = route(t["user_prompt"], pool, top_k=top_k, llm_call_fn=llm_call_fn,
-                       prefer_llm=llm_call_fn is not None)
+        result = results_by_prompt[t["user_prompt"]]
         pred = set(result.selected)
         oracle = t["selected_tools"]
         tp = len(pred & oracle)
@@ -155,29 +176,62 @@ def evaluate(
     tasks: List[Dict[str, Any]],
     pools: Dict[str, List[Dict[str, Any]]],
     top_k: int,
-    llm_call_fn=None,
+    llm_config_path: str = None,
+    concurrency: int = 8,
 ) -> None:
-    """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_call_fn 时只跑粗筛)。"""
-    variants = [("TF-IDF 粗筛", None)]
-    if llm_call_fn is not None:
-        variants.append(("粗筛 + LLM 精排", llm_call_fn))
+    """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_config_path 时只跑粗筛)。
 
+    粗筛先跑先出结果;langchain 导入与 client 初始化只在第二轮前发生
+    (启动不再被依赖加载阻塞)。LLM 调用并发执行(--concurrency 限流)。
+    """
     verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
     results = {}
-    for name, fn in variants:
-        if fn is None:
-            print(f"\n{'#' * 66}\n# 变体: {name}\n{'#' * 66}")
-        results[name] = _eval_one_variant(tasks, pools, top_k, llm_call_fn=fn, verbose=verbose)
-        print_variant(name, results[name], top_k, verbose)
 
-    if len(results) == 2:
-        (n1, a1), (n2, a2) = results.items()
-        d_r = a2["ALL"]["tp"] / a2["ALL"]["n_sel"] - a1["ALL"]["tp"] / a1["ALL"]["n_sel"]
-        d_p = a2["ALL"]["tp"] / a2["ALL"]["n_pred"] - a1["ALL"]["tp"] / a1["ALL"]["n_pred"]
-        print(f"\n=== 消融对照 ===")
-        print(f"  recall@{top_k}: {a1['ALL']['tp']/a1['ALL']['n_sel']:.1%} -> {a2['ALL']['tp']/a2['ALL']['n_sel']:.1%} ({d_r:+.1%})")
-        print(f"  precision@{top_k}: {a1['ALL']['tp']/a1['ALL']['n_pred']:.1%} -> {a2['ALL']['tp']/a2['ALL']['n_pred']:.1%} ({d_p:+.1%})")
+    # 变体 1:纯粗筛(纯 CPU,毫秒级/任务)
+    print(f"\n{'#' * 66}\n# 变体: TF-IDF 粗筛\n{'#' * 66}")
+    t0 = time.perf_counter()
+    results["TF-IDF 粗筛"] = _eval_one_variant(tasks, pools, top_k, llm_call_async=None,
+                                               verbose=verbose)
+    print(f"(粗筛耗时 {time.perf_counter() - t0:.2f}s)")
 
+    if llm_config_path is None:
+        print_variant("TF-IDF 粗筛", results["TF-IDF 粗筛"], top_k, verbose)
+        _print_targets(top_k)
+        return
+
+    # 变体 2:粗筛 + LLM 精排 —— 此时才加载 langchain(粗筛结果已先输出)
+    print("\n加载 LLM 精排客户端(langchain 导入 + client 初始化)...")
+    t0 = time.perf_counter()
+    llm_call_async, latencies = build_llm_call_fn(llm_config_path)
+    print(f"(加载耗时 {time.perf_counter() - t0:.2f}s)")
+
+    print(f"\n{'#' * 66}\n# 变体: 粗筛 + LLM 精排(并发={concurrency})\n{'#' * 66}")
+    t0 = time.perf_counter()
+    results["粗筛 + LLM 精排"] = _eval_one_variant(tasks, pools, top_k,
+                                                   llm_call_async=llm_call_async,
+                                                   concurrency=concurrency, verbose=verbose)
+    elapsed = time.perf_counter() - t0
+    print_variant("粗筛 + LLM 精排", results["粗筛 + LLM 精排"], top_k, verbose)
+
+    if latencies:
+        lat = sorted(latencies)
+        n = len(lat)
+        print(f"\nLLM 单次调用延迟({n} 次): "
+              f"min={lat[0]:.2f}s p50={lat[n//2]:.2f}s max={lat[-1]:.2f}s "
+              f"mean={sum(lat)/n:.2f}s | 串行总计≈{sum(lat):.1f}s,并发后实际 {elapsed:.1f}s")
+
+    # 消融对照
+    a1 = results["TF-IDF 粗筛"]["ALL"]
+    a2 = results["粗筛 + LLM 精排"]["ALL"]
+    print(f"\n=== 消融对照(粗筛 -> 粗筛+LLM精排)===")
+    print(f"  recall@{top_k}: {a1['tp']/a1['n_sel']:.1%} -> {a2['tp']/a2['n_sel']:.1%} "
+          f"({a2['tp']/a2['n_sel'] - a1['tp']/a1['n_sel']:+.1%})")
+    print(f"  precision@{top_k}: {a1['tp']/a1['n_pred']:.1%} -> {a2['tp']/a2['n_pred']:.1%} "
+          f"({a2['tp']/a2['n_pred'] - a1['tp']/a1['n_pred']:+.1%})")
+    _print_targets(top_k)
+
+
+def _print_targets(top_k: int) -> None:
     print(f"\n目标:recall@{top_k} >= 90%(漏一个工具任务即败;渐进式扩展会兜底到 1.0)")
     print(f"     precision@{top_k} 0.5-0.7 即可(宁多勿少);full_cov 越高,渐进式扩展触发越少")
 
@@ -206,13 +260,14 @@ def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, 
 
 def build_llm_call_fn(llm_config_path: str):
     """从 LLM 配置文件(conf/llm/<name>.json,与 evaluate.py 同格式)构建
-    llm_call_fn(prompt) -> str。懒导入:未传 --llm_config 时不加载 langchain。
+    异步 llm_call_async(prompt) -> Awaitable[str] 及延迟记录列表。
+
+    懒导入:只在用到 --llm_config 时才加载 langchain(纯粗筛路径零依赖)。
+    异步 + 信号量并发是关键:网关延迟被并发摊平,串行 1150 次调用是不可用的。
 
     ⚠️ 诚实性边界:LLM 精排的输入只有任务文本与候选工具名/描述,
     绝不读取 selected_tools —— 该字段只在这里用作评分 ground truth。
     """
-    import asyncio
-
     from benchmark.llm_client import LLMClient, get_text_content
     from benchmark_utils import load_llm_configs
     from langchain_core.messages import HumanMessage
@@ -232,11 +287,15 @@ def build_llm_call_fn(llm_config_path: str):
         reasoning=cfg.reasoning,
     )
 
-    def llm_call(prompt: str) -> str:
-        resp = asyncio.run(client.llm.ainvoke([HumanMessage(content=prompt)]))
+    latencies: List[float] = []
+
+    async def llm_call_async(prompt: str) -> str:
+        t0 = time.perf_counter()
+        resp = await client.llm.ainvoke([HumanMessage(content=prompt)])
+        latencies.append(time.perf_counter() - t0)
         return get_text_content(resp.content)
 
-    return llm_call
+    return llm_call_async, latencies
 
 
 def main() -> None:
@@ -250,6 +309,8 @@ def main() -> None:
     ap.add_argument("--llm_config", default=None,
                     help="LLM 配置 JSON(conf/llm/<name>.json 同格式);提供时同时评估"
                          "『粗筛』与『粗筛+LLM精排』两组并输出消融对照。需 langchain 依赖。")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="LLM 精排并发数(默认 8)。网关限流严格时调低,内网网关可调高。")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
@@ -271,15 +332,15 @@ def main() -> None:
               ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
     print(f"共 {len(tasks)} 任务, top_k={args.top_k}\n")
 
-    llm_call_fn = None
     if args.llm_config:
-        llm_call_fn = build_llm_call_fn(args.llm_config)
-        print(f"已启用 LLM 精排(router LLM: {args.llm_config}),将与纯粗筛做消融对照\n")
+        print(f"已启用 LLM 精排(router LLM: {args.llm_config}, 并发={args.concurrency}),"
+              f"将与纯粗筛做消融对照\n")
 
     print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
     print("-" * 96)
     inspect_sample(tasks, pools, args.top_k)
-    evaluate(tasks, pools, args.top_k, llm_call_fn=llm_call_fn)
+    evaluate(tasks, pools, args.top_k,
+             llm_config_path=args.llm_config, concurrency=args.concurrency)
 
 
 if __name__ == "__main__":

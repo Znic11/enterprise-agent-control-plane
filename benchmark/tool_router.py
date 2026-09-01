@@ -289,6 +289,15 @@ def parse_llm_route_response(text: str) -> Optional[List[str]]:
     return names or None
 
 
+def _build_route_prompt(task_text: str, candidate_tools: List[Dict[str, Any]]) -> str:
+    lines = []
+    for tool in candidate_tools:
+        name = str(tool.get("name", ""))
+        desc = str(tool.get("description", "")).replace("\n", " ")[:120]
+        lines.append(f"- {name}: {desc}")
+    return ROUTER_PROMPT.format(task=task_text, tools="\n".join(lines))
+
+
 def route_llm(
     task_text: str,
     candidate_tools: List[Dict[str, Any]],
@@ -299,23 +308,46 @@ def route_llm(
 
     ``llm_call_fn(prompt) -> str`` 由调用方注入;本模块不依赖任何 LLM SDK。
     """
-    lines = []
-    for tool in candidate_tools:
-        name = str(tool.get("name", ""))
-        desc = str(tool.get("description", "")).replace("\n", " ")[:120]
-        lines.append(f"- {name}: {desc}")
-    prompt = ROUTER_PROMPT.format(task=task_text, tools="\n".join(lines))
+    prompt = _build_route_prompt(task_text, candidate_tools)
     try:
         raw = llm_call_fn(prompt)
     except Exception as e:  # noqa: BLE001 — 路由绝不能崩掉整个 run
         logger.warning(f"LLM router call failed ({e})")
         return None
+    names = _parse_and_validate(raw, candidate_tools)
+    return names[:top_k] if names else names
+
+
+def _parse_and_validate(
+    raw: str, candidate_tools: List[Dict[str, Any]]
+) -> Optional[List[str]]:
+    """解析 LLM 输出并过滤幻觉工具名(同步/异步精排共用)。"""
     names = parse_llm_route_response(raw)
     if names is None:
         logger.warning("LLM router returned unparseable output")
         return None
     valid = {str(t.get("name")) for t in candidate_tools}
-    return [n for n in names if n in valid][:top_k]
+    return [n for n in names if n in valid]
+
+
+async def route_llm_async(
+    task_text: str,
+    candidate_tools: List[Dict[str, Any]],
+    llm_call_fn_async: Callable[[str], Any],
+    top_k: int = DEFAULT_TOP_K,
+) -> Optional[List[str]]:
+    """route_llm 的异步版(``llm_call_fn_async(prompt) -> Awaitable[str]``)。
+
+    供 batch_route 并发使用;解析与校验规则与 route_llm 完全一致。
+    """
+    prompt = _build_route_prompt(task_text, candidate_tools)
+    try:
+        raw = await llm_call_fn_async(prompt)
+    except Exception as e:  # noqa: BLE001 — 路由绝不能崩掉整个 run
+        logger.warning(f"LLM router call failed ({e})")
+        return None
+    names = _parse_and_validate(raw, candidate_tools)
+    return names[:top_k] if names else names
 
 
 # ---------------------------------------------------------------------------
@@ -408,3 +440,77 @@ def route(
         candidate_size=meta.get("candidate_size", len(subset)),
         top_score=top_score,
     )
+
+
+async def batch_route(
+    task_texts: List[str],
+    all_tools: List[Dict[str, Any]],
+    top_k: int = DEFAULT_TOP_K,
+    llm_call_fn_async: Optional[Callable[[str], Any]] = None,
+    concurrency: int = 8,
+    progress_fn: Optional[Callable[[int, int], None]] = None,
+) -> Dict[str, RouteResult]:
+    """批量路由:TF-IDF 索引只建一次 + LLM 精排并发执行(语义与 route() 一致)。
+
+    单任务请用 route()(orchestrator 执行路径);同批多任务(离线评估/
+    全量跑)用本函数 —— 否则每任务重建索引、且 LLM 调用串行等网关。
+
+    回退规则与 route() 保持一致(改动需两处同步):
+      置信度低 → full_fallback(全量);LLM 失败或选中 < MIN_LLM_SELECTED → 粗筛子集。
+    """
+    import asyncio
+
+    if not all_tools:
+        logger.warning("batch_route() called with an empty tool pool")
+        return {t: RouteResult(method="empty", task_text=t) for t in task_texts}
+
+    # ① 粗筛:索引建一次,纯 CPU,毫秒级/任务
+    router = ToolRouter(all_tools, k_candidate=max(DEFAULT_K_CANDIDATE, top_k), k_final=top_k)
+    coarse = {t: router.route(t) for t in task_texts}
+
+    # ② 精排:并发(信号量限流),网关延迟被并发摊平
+    sem = asyncio.Semaphore(max(1, concurrency))
+    done = [0]
+
+    async def _one(task_text: str):
+        subset, meta = coarse[task_text]
+        top_score = meta.get("top_score", 0.0)
+        common = dict(full_tool_count=len(all_tools), task_text=task_text, top_score=top_score)
+
+        if meta.get("fallback"):  # ⑤ 置信度回退 → 全量
+            return task_text, RouteResult(
+                selected=[t["name"] for t in all_tools],
+                method="full_fallback", fallback=meta["fallback"], **common)
+
+        if llm_call_fn_async is None:  # 纯粗筛
+            return task_text, RouteResult(
+                selected=[t["name"] for t in subset], method="tfidf",
+                candidate_size=meta.get("candidate_size", len(subset)), **common)
+
+        cand_names = meta.get("candidate_names") or [t["name"] for t in subset]
+        cand_tools = [router.by_name[n] for n in cand_names if n in router.by_name]
+        async with sem:
+            llm_names = await route_llm_async(task_text, cand_tools, llm_call_fn_async, top_k)
+        done[0] += 1
+        if progress_fn:
+            progress_fn(done[0], len(task_texts))
+
+        if llm_names is None:
+            logger.warning("[ROUTER] LLM rerank failed; keeping TF-IDF subset")
+        elif len(llm_names) < MIN_LLM_SELECTED:
+            logger.warning(
+                f"[ROUTER] LLM selected only {len(llm_names)} tools (<{MIN_LLM_SELECTED}); "
+                f"keeping TF-IDF subset"
+            )
+        else:
+            subset = [router.by_name[n] for n in llm_names if n in router.by_name]
+            return task_text, RouteResult(
+                selected=[t["name"] for t in subset], method="tfidf+llm",
+                candidate_size=meta.get("candidate_size", len(subset)), **common)
+
+        return task_text, RouteResult(  # LLM 失败/过少 → 回退粗筛子集
+            selected=[t["name"] for t in subset], method="tfidf",
+            candidate_size=meta.get("candidate_size", len(subset)), **common)
+
+    pairs = await asyncio.gather(*(_one(t) for t in task_texts))
+    return dict(pairs)
