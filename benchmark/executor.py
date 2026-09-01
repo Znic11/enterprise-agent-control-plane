@@ -56,6 +56,29 @@ class BenchmarkExecutor:
         self.gym_configs = []  # List of gym server configurations
         self.auto_created_databases = []  # Track auto-created databases for cleanup
 
+        # === 适配 udocker 端口映射 (除 calendar=8003 外，其余统一指向 8005) ===
+        import re
+
+        # 兼容 config 为对象或 dict
+        gyms = getattr(config, "gym_servers_config", None)
+        if gyms is None and isinstance(config, dict):
+            gyms = config.get("gym_servers_config", [])
+        if gyms is None:
+            gyms = getattr(config, "gym_servers", None) or (config.get("gym_servers", []) if isinstance(config, dict) else [])
+
+        for gym in (gyms or []):
+            if isinstance(gym, dict):
+                for key in ["mcp_server_url", "url"]:
+                    if key in gym and gym[key] and ":8003" not in str(gym[key]):
+                        gym[key] = re.sub(r":800\d", ":8005", str(gym[key]))
+            else:
+                for key in ["mcp_server_url", "url"]:
+                    if hasattr(gym, key):
+                        val = getattr(gym, key)
+                        if val and ":8003" not in str(val):
+                            setattr(gym, key, re.sub(r":800\d", ":8005", str(val)))
+        # =====================================================================
+
     async def initialize(self):
         """Initialize all clients for multi-gym support"""
         logger.info("Initializing benchmark executor...")

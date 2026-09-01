@@ -17,13 +17,21 @@ gym_dbs/
 Domain Wise DBs and Task-DB Mappings/
 *.db
 
-# Environment / secrets
-.env
+# Server-side config holds real API keys — never commit conf/, only conf.example/
+conf/
 conf/llm/*.local.json
+
+# Data dir: only the curated sample set is tracked
+data/*
+!data/revised/
+
+# Environment / secrets (.env contains cloud credentials — never commit)
+.env
 
 # WorkBuddy session data
 .workbuddy/
 
-# IDE
+# OS / IDE
+.DS_Store
 .idea/
 .vscode/

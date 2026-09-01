@@ -126,10 +126,20 @@ LLM provider 成本敏感时的推荐评测节奏（详见 `docs/HANDOFF.md`）�
 ├── evaluate.py           # 评测执行器（断点续跑 · 失败重试）
 ├── compute_score.py      # 通过率汇总（论文口径）
 ├── ray_experiment_queue.py  # Ray 分布式批量评测
+├── RUN_GUIDE.md          # 服务器部署手册（udocker 容器 · 全流程指令）
 ├── data/revised/         # 本地任务样本（csm / itsm）
 ├── docs/                 # 设计文档与迭代记录
 └── Domain Wise DBs and Task-DB Mappings/  # SQL 快照（从 gym_dbs.zip 恢复）
 ```
+
+## 部署说明
+
+本仓库已在真实服务器环境（udocker 容器）跑通全流程，相关适配：
+
+- `benchmark/executor.py`：udocker 端口映射适配（除 calendar 8003 外统一指向 8005）；
+- `benchmark/llm_client.py`：新增 `ustc` provider（Anthropic 兼容网关，Bearer 鉴权 + 300s 超时 + 自动重试），适配国内中转站。
+
+服务器端完整操作手册（容器创建、各域启停、状态检查、清理脚本）见 [RUN_GUIDE.md](RUN_GUIDE.md)。
 
 ## 评测基线对照
 
