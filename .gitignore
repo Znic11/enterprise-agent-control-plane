@@ -1,29 +1,15 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-build/
-dist/
-
-# Runtime artifacts (regenerable; large result files not tracked at baseline)
+conf/
+data/*
+!data/revised/
+Domain Wise DBs and Task-DB Mappings/
 results/
 logs/
-*.log
-
-# Databases / archives (restore via gym_dbs.zip, see README)
-gym_dbs/
-Domain Wise DBs and Task-DB Mappings/
-*.db
-
-# Environment / secrets
+*.pyc
+__pycache__/
+.venv/
+.DS_Store
+# .env contains cloud credentials (AWS, GCP) — never commit
 .env
-conf/llm/*.local.json
-
+uv.lock
 # WorkBuddy session data
 .workbuddy/
-
-# IDE
-.idea/
-.vscode/

@@ -1,141 +1,336 @@
 <div align="center">
 
-<h1>Enterprise Agent Control Plane</h1>
-
-<p><i>把研究级 agent 变成能在真实环境部署的企业级 agent —— 以 EnterpriseOps-Gym 为基准，构建分层控制平面。</i></p>
+<h1><img src="assets/csmgym.png" alt="EnterpriseOps-Gym Logo" width="48" style="vertical-align:middle; margin-right:10px;" /> EnterpriseOps-Gym: Environments and Evaluations for Stateful Agentic Planning and Tool Use in Enterprise Settings</h1>
 
 <p>
-  <a href="https://arxiv.org/abs/2603.13594"><img src="https://img.shields.io/badge/paper-arXiv%202603.13594-blue?logo=arxiv" /></a>
-  <a href="https://huggingface.co/datasets/ServiceNow-AI/EnterpriseOps-Gym"><img src="https://img.shields.io/badge/benchmark-EnterpriseOps--Gym-yellow" /></a>
-  <a href="https://github.com/ServiceNow/EnterpriseOps-Gym"><img src="https://img.shields.io/badge/upstream-ServiceNow%2FEnterpriseOps--Gym-green" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202-blue" /></a>
+  <a href="https://enterpriseops-gym.github.io/"><img src="https://img.shields.io/badge/Website-green?logo=googlechrome&logoColor=white" /></a>
+  <a href="https://arxiv.org/abs/2603.13594"><img src="https://img.shields.io/badge/Paper-blue?logo=arxiv&logoColor=white" /></a>
+<a href="https://huggingface.co/datasets/ServiceNow-AI/EnterpriseOps-Gym"><img src="https://img.shields.io/badge/🤗_Dataset-yellow" /></a>
+  <a href="https://github.com/ServiceNow/EnterpriseOps-Gym/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202-blue" /></a>
+</p>
+
+<p><i>EnterpriseOps-Gym is a containerized, resettable enterprise simulation benchmark for evaluating LLM agents on stateful, multi-step planning and tool use across realistic enterprise workflows</i></p>
+
+<p><b>Authors</b></p>
+
+<p><small>
+  Shiva Krishna Reddy Malay<sup>*,1</sup> &nbsp;&nbsp;
+Shravan Nayak<sup>*,1,2,3</sup> &nbsp;&nbsp;
+Jishnu Sethumadhavan Nair<sup>1</sup> &nbsp;&nbsp;
+Aman Tiwari<sup>1</sup> &nbsp;&nbsp;
+Sathwik Tejaswi Madhusudhan<sup>1</sup> &nbsp;&nbsp;
+Sagar Davasam<sup>1</sup> &nbsp;&nbsp;
+Sridhar Krishna Nemala<sup>1</sup> &nbsp;&nbsp;
+Srinivas Sunkara<sup>1</sup> &nbsp;&nbsp;
+Sai Rajeswar<sup>1,2,3</sup>
+</small></p>
+
+<p>
+  <sup>*</sup>Equal contribution &nbsp;|&nbsp;
+  <sup>1</sup>ServiceNow AI Research &nbsp;|&nbsp;
+  <sup>2</sup>Mila – Quebec AI Institute &nbsp;|&nbsp;
+  <sup>3</sup>Université de Montréal
 </p>
 
 </div>
 
 ---
 
-## 这是什么
+## 📖 Introduction
 
-Agent 领域不缺能跑通 toy task 的 demo，缺的是**能部署到真实企业环境的 agent**。两者的分水岭不在单步工具调用，而在控制平面：
+**EnterpriseOps-Gym** evaluates LLM agents on **1,150 expert-curated tasks** across **8 enterprise domains** — Calendar, CSM, Drive, Email, HR, ITSM, Teams, and Hybrid — in a fully interactive, containerized environment.
 
-- 研究级 agent：一次性的 ReAct 循环，工具集固定，失败靠重试，无状态无审计，成本不可控。
-- 企业级 agent：**意图识别 → 结构化规划 → 受控执行 → 状态验证**的闭环，配齐记忆、政策合规、可观测性、成本治理四根横向支柱。
+Unlike static datasets, tasks run against live MCP servers and are evaluated by SQL verifiers that check **final environment state**, not action sequences.
 
-本仓库以 **EnterpriseOps-Gym**（1,150 个专家任务、512 个工具、8 个企业域、SQL 状态验证器）为训练与评测基准，从零实现并持续演进一个企业级 agent 控制平面。
+**Key Features:**
 
-## 目标架构
+- 🛠️ **512 tools** across 8 enterprise domains
+- 🗄️ **164 database tables** with avg 1.7 foreign-key dependencies per table
+- 🔢 **9.15 avg steps** per task (up to 34), with **5.3 avg verification conditions**
+- 📏 **89k avg context length** per task
+- 🏆 Best model achieves only **34.1%** success rate — significant headroom for improvement
 
-```
-                         ┌─────────────────────────────────────────┐
-  用户请求 ──▶ 入口层      │  意图识别 · 域路由 · 任务分类            │
-                         └───────────────┬─────────────────────────┘
-                                         ▼
-                         ┌─────────────────────────────────────────┐
-                         │  规划层 结构化计划 · 动态重规划 · 子目标分解 │
-                         └───────────────┬─────────────────────────┘
-                                         ▼
-                         ┌─────────────────────────────────────────┐
-                         │  执行层 ReAct 内核 · 工具路由 · 幂等重试    │
-                         └───────────────┬─────────────────────────┘
-                                         ▼
-                         ┌─────────────────────────────────────────┐
-                         │  验证层 verifier-in-the-loop · 终态自查    │
-                         └─────────────────────────────────────────┘
-     ─────────────────────────────────────────────────────────────────
-     横向支撑：分层记忆 │ 政策合规引擎 │ 可观测性(全链路审计) │ 成本控制
-     ─────────────────────────────────────────────────────────────────
-```
+<div align="center">
+<img src="assets/teaser.png" alt="EnterpriseOps-Gym Overview" width="100%" />
+</div>
 
-**设计理念：control plane 与 data plane 分离。** ReAct 循环只负责"干活"（data plane），意图路由、规划、验证、治理全部由上层控制平面接管——这是从云原生基础设施（Kubernetes / etcd 的 control plane 模式）借鉴来的架构语言。
+---
 
-## 当前实现状态（如实标注）
+## 📋 Table of Contents
 
-| 模块 | 状态 | 说明 |
-|---|---|---|
-| 工具路由 `benchmark/tool_router.py` | ✅ 已实现 | TF-IDF 漏斗 + 可选 LLM 精排，路由质量可离线评测 |
-| 离线路由评测 `eval_router.py` | ✅ 已实现 | 零 LLM 成本，用任务自带 `selected_tools` 标注评估 `recall@k` / `precision@k` |
-| 编排器 ×4 `orchestrators/` | ✅ 已实现 | `react` / `planner_react` / `decomposing` / `react_router` |
-| 执行器与验证器 `benchmark/executor.py` `benchmark/verifier.py` | ✅ 已实现 | SQL 终态验证，非动作序列验证 |
-| 离线评测闭环 `evaluate.py` + `compute_score.py` | ✅ 已实现 | 支持断点续跑、失败自动重试、多 run 统计 |
-| 分层记忆 | 🚧 设计中 | 短期会话记忆已进规划层，长期记忆未落地 |
-| 政策合规引擎 | 🚧 设计中 | 策略即代码 + 执行前检查钩子 |
-| 可观测性 | 🟡 部分 | 全链路 tool 调用日志已有，trace 聚合未落地 |
-| 成本控制 | 🚧 设计中 | 路由层已考虑小模型优先，细粒度配额未落地 |
+- [⚙️ Installation](#️-installation)
+- [🔧 Prerequisites](#-prerequisites)
+- [🚀 Running the Benchmark](#-running-the-benchmark)
+- [📊 Scoring](#-scoring)
+- [🏆 Leaderboard](#-leaderboard)
+- [📚 Citation](#-citation)
 
-> 诚实声明：架构蓝图覆盖四层四支柱，但**记忆 / 政策 / 可观测性 / 成本治理尚在设计中**。本仓库的可运行部分（路由 + 编排 + 验证 + 评测闭环）均已实现并可通过下方流程复现结果。
+---
 
-## 快速开始
+## ⚙️ Installation
 
-### 1. 环境准备
+Requires **Python 3.11+** and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# 依赖（Python 3.11+，按需选 provider）
-uv sync --extra deepseek    # 或 --extra openai / anthropic / all
+git clone https://github.com/ServiceNow/EnterpriseOps-Gym.git
+cd EnterpriseOps-Gym
 
-# 数据库快照
-unzip gym_dbs.zip
+# Install with only the provider(s) you need
+uv sync --extra anthropic    # Claude / AWS Bedrock
+uv sync --extra openai       # OpenAI / Azure OpenAI
+uv sync --extra google       # Gemini / Vertex AI
+uv sync --extra deepseek     # DeepSeek
+uv sync --extra all          # Everything
+```
 
-# LLM 配置（API key 放在 conf/llm/*.local.json，已被 gitignore）
+Copy and configure the example configs:
+
+```bash
 cp -r conf.example/ conf/
+# Edit conf/llm/my-model.json with your API key and model details
 ```
 
-### 2. 启动域 MCP 服务器（Docker）
+---
 
-```bash
-docker run -d -p 8001:8001 shivakrishnareddyma225/enterpriseops-gym-mcp-csm:latest
-# 各域默认端口见 upstream README：teams 8002 / calendar 8003 / email 8004 / itsm 8006 / hr 8008 / drive 8009
+## 🔧 Prerequisites
+
+### 1. Seed Databases
+
+Each task runs against a pre-populated database seeded from a SQL snapshot. These snapshots are bundled in `gym_dbs.zip` at the root of the repository — one SQL file per unique database, organized by domain:
+
+```
+Domain Wise DBs and Task-DB Mappings/
+  calendar/dbs/   # Calendar domain database snapshots
+  csm/dbs/        # Customer Service Management snapshots
+  drive/dbs/      # Drive domain snapshots
+  email/dbs/      # Email domain snapshots
+  hr/dbs/         # HR domain snapshots
+  hybrid/dbs/     # Multi-domain (hybrid) snapshots
+  itsm/dbs/       # IT Service Management snapshots
+  teams/dbs/      # Teams domain snapshots
 ```
 
-### 3. 跑评测
+Unzip it before running the benchmark:
 
 ```bash
-# 单个域（从 HuggingFace 拉任务配置）
+unzip gym_dbs.zip
+```
+
+### 2. Gym Servers
+
+Each domain requires a running MCP server. Pull and start the Docker image for each domain:
+
+```bash
+docker pull shivakrishnareddyma225/enterpriseops-gym-mcp-<domain>:latest
+docker run -d -p <host_port>:<container_port> shivakrishnareddyma225/enterpriseops-gym-mcp-<domain>:latest
+```
+
+Default ports:
+
+| Domain | MCP Server | Port |
+|--------|-----------|------|
+| `teams` | `gym-teams-mcp` | 8002 |
+| `csm` | `sn-csm-server` | 8001 |
+| `email` | `gym-email-mcp` | 8004 |
+| `itsm` | `gym-itsm-mcp` | 8006 |
+| `calendar` | `gym-calendar` | 8003 |
+| `hr` | `sn-hr-internal` | 8008 |
+| `drive` | `gym-google-drive-mcp` | 8009 |
+| `<container_port>` | N/A | 8005 |
+
+Update `conf/ray/domain_conf.json` if you use non-default ports. For `calendar` use 8003 as the container_port. 
+
+### 2. LLM Config
+
+LLM configs live in `conf/llm/<name>.json`. Use an array for load-balanced pools.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `llm_provider` | ✅ | `anthropic`, `aws_bedrock`, `openai`, `azureopenai`, `googlevertexai`, `google`, `vllm`, `openrouter`, `deepseek`, `qwq` |
+| `llm_model` | ✅ | Model identifier |
+| `llm_api_key` | ✅ | API key |
+| `llm_api_endpoint` | — | Required for Azure OpenAI / vLLM |
+| `llm_api_version` | — | Required for Azure OpenAI |
+| `llm_region` | — | Region for `aws_bedrock` / `googlevertexai` |
+| `temperature` | — | Default `0.0` |
+| `max_tokens` | — | Default `4096` |
+| `reasoning` | - | Reasoning Parameters |
+
+```json
+{
+    "llm_provider": "azureopenai",
+    "llm_model": "gpt-4.1",
+    "llm_api_key": "<your-api-key>",
+    "llm_api_endpoint": "https://<your-resource>.openai.azure.com",
+    "llm_api_version": "2025-04-01-preview",
+    "temperature": 0.1,
+    "max_tokens": 16384
+}
+```
+
+---
+
+## 🚀 Running the Benchmark
+
+### Option A — Ray *(recommended)*
+
+Ray orchestrates parallel runs across models and domains.
+
+**1. Create an experiment config** (`conf/ray/experiment.json`):
+
+```json
+{
+    "llms": ["gpt-4.1-mini", "gemini_2p5"],
+    "domains": ["teams", "csm", "email"],
+    "modes": ["oracle", "plus_5_tools", "plus_10_tools", "plus_15_tools"],
+    "orchestrator": "react",
+    "num_runs": 1,
+    "num_llm_instances": 1,
+    "path_templates": {
+        "log_dir": "logs/{orchestrator}/{llm}/{domain}/{mode}",
+        "output_folder": "results/{orchestrator}/{llm}/{domain}/{mode}",
+        "llm_config": "conf/llm/{llm}.json"
+    }
+}
+```
+
+Per-model task concurrency is set in `conf/ray/llm_concurrency.json` (defaults to 5):
+
+```json
+{ "gpt-4.1-mini": 4, "gemini_2p5": 4 }
+```
+
+**2. Run:**
+
+```bash
+python ray_experiment_queue.py --experiment_config conf/ray/experiment.json
+```
+
+---
+
+### Option B — Direct
+
+Run a single domain/mode without Ray. **Use this option for the `hybrid` domain.**
+
+```bash
 python evaluate.py \
     --hf_dataset ServiceNow-AI/EnterpriseOps-Gym \
     --domain teams --mode oracle \
-    --llm_config conf/llm/my-model.local.json \
-    --output_folder results/react/my-model/teams/oracle \
+    --llm_config conf/llm/gpt-4.1-mini.json \
+    --output_folder results/react/gpt-4.1-mini/teams/oracle \
     --orchestrator react \
     --concurrency 4 --num_runs 1
-
-# 离线工具路由评测（零 LLM 成本，迭代期首选）
-python eval_router.py --data_dir data/revised --top_k 20
-
-# 汇总通过率（论文口径：任务全 verifier 通过 = success）
-python compute_score.py --results_folder results/react/my-model/teams
 ```
 
-支持 `--orchestrator planner_react / decomposing / react_router`，以及 Ray 分布式编排 `ray_experiment_queue.py`。
+For hybrid tasks:
 
-## 低预算验证方法
-
-LLM provider 成本敏感时的推荐评测节奏（详见 `docs/HANDOFF.md`）：
-
-1. **第 0 层**：`eval_router.py` 离线路由评测，不烧 token；
-2. **第 1 层**：单域固定子集（20~30 任务，oracle 模式，`--num_runs 1`）做日常迭代，`evaluate.py` 自带断点续跑，中断不浪费；
-3. **第 2 层**：跨域小样本回归；
-4. **第 3 层**：全量 + `--num_runs 3`，只在最终报告时跑一次。
-
-## 目录结构
-
-```
-├── benchmark/            # 执行器 / MCP 客户端 / LLM 客户端 / 验证器 / 工具路由器
-├── orchestrators/        # react / planner_react / decomposing / react_router
-├── eval_router.py        # 离线路由质量评测（零成本）
-├── evaluate.py           # 评测执行器（断点续跑 · 失败重试）
-├── compute_score.py      # 通过率汇总（论文口径）
-├── ray_experiment_queue.py  # Ray 分布式批量评测
-├── data/revised/         # 本地任务样本（csm / itsm）
-├── docs/                 # 设计文档与迭代记录
-└── Domain Wise DBs and Task-DB Mappings/  # SQL 快照（从 gym_dbs.zip 恢复）
+```bash
+python evaluate.py \
+    --hf_dataset ServiceNow-AI/EnterpriseOps-Gym \
+    --domain hybrid --mode oracle \
+    --llm_config conf/llm/gpt-4.1-mini.json \
+    --output_folder results/react/gpt-4.1-mini/hybrid/oracle \
+    --orchestrator react \
+    --concurrency 2 --num_runs 1
 ```
 
-## 评测基线对照
+**Orchestrators:**
 
-任务通过判定与上游一致：**仅当全部 SQL 验证条件满足才算成功**（非动作序列匹配）。各模型在上游全量基准的成绩见 [EnterpriseOps-Gym 论文](https://arxiv.org/abs/2603.13594) 与 [upstream README](https://github.com/ServiceNow/EnterpriseOps-Gym#leaderboard)——运行 `compute_score.py` 即可按相同口径得到本 agent 的结果并直接对比。
+| Value | Description |
+|-------|-------------|
+| `react` | Standard ReAct loop |
+| `planner_react` | Planner generates a plan; executor follows it |
+| `decomposing` | Decomposes task into sub-goals before executing |
 
-## 致谢与许可
+For `planner_react` / `decomposing`, add `--planner_llm_config conf/llm/<planner>.json`.
 
-- 基准环境、任务与 MCP 服务器来自 [ServiceNow/EnterpriseOps-Gym](https://github.com/ServiceNow/EnterpriseOps-Gym)（Apache 2.0），本仓库在其基础上演进，工具路由层与评测工作流为本仓库增量。
-- 本仓库以 [Apache License 2.0](LICENSE) 发布。
+---
+
+## 📊 Scoring
+
+```bash
+# Single run
+python compute_score.py --results_folder results/react/gpt-4.1-mini/teams/oracle
+
+# All modes at once
+python compute_score.py --results_folder results/react/gpt-4.1-mini/teams
+```
+
+Output:
+
+```
++----------------+---------------+-----------------+----------------------+-----------------------+
+| Mode           | Total Files   | Files w/ Errors | Avg Success Rate (%) | Avg Verifier Pass (%) |
++================+===============+=================+======================+=======================+
+| oracle         | 100           | 0               | 72.00                | 68.50                 |
++----------------+---------------+-----------------+----------------------+-----------------------+
+| plus_5_tools   | 100           | 0               | 65.00                | 61.20                 |
++----------------+---------------+-----------------+----------------------+-----------------------+
+```
+
+- **Avg Success Rate** — tasks where *all* verifiers passed
+- **Avg Verifier Pass** — average per-verifier pass rate
+- **Files w/ Errors** — agent errors; excluded from averages
+
+---
+
+## 🏆 Leaderboard
+
+Task success rate (%) on Oracle mode on the full benchmark. A task passes only if **all** verification conditions are met.
+
+| Model | Teams | CSM | Email | ITSM | Calendar | HR | Drive | Hybrid | **Avg** |
+|-------|:-----:|:---:|:-----:|:----:|:--------:|:--:|:-----:|:------:|:-------:|
+| **Closed Source** | | | | | | | | | |
+| Claude Opus 4.6 | **52.0** | 45.1 | 57.7 | 33.3 | **43.3** | **45.1** | **57.1** | **34.0** | **45.9** |
+| Claude Sonnet 4.6 | 47.0 | 32.6 | **58.6** | **35.5** | 40.4 | 37.0 | 57.1 | 29.4 | 42.2 |
+| Claude Opus 4.5 | 50.0 | 34.2 | 51.9 | 23.8 | 43.2 | 32.1 | 49.5 | 30.7 | 39.4 |
+| Gemini-3.1-Pro | 46.0 | **46.7** | 47.1 | 32.8 | 40.4 | 10.9 | 55.2 | 30.1 | 38.7 |
+| Claude Sonnet 4.5 | 51.0 | 16.7 | 51.3 | 17.6 | 34.6 | 21.6 | 52.1 | 28.1 | 34.1 |
+| Gemini-3-Flash | 47.3 | 35.0 | 44.3 | 28.5 | 30.5 | 12.6 | 49.7 | 24.2 | 34.0 |
+| Gemini-3-Pro | 43.0 | 27.7 | 33.6 | 22.2 | 28.8 | 12.5 | 46.7 | 22.9 | 29.7 |
+| GPT-5 | 26.3 | 36.4 | 49.0 | 18.9 | 41.3 | 17.9 | 34.0 | 23.5 | 30.9 |
+| GPT-5-Mini | 25.7 | 15.8 | 47.4 | 8.9 | 28.8 | 10.7 | 23.8 | 22.5 | 22.9 |
+| Gemini-2.5-Pro | 39.3 | 11.6 | 31.1 | 13.9 | 12.5 | 4.9 | 27.0 | 19.6 | 20.0 |
+| **Open Source** | | | | | | | | | |
+| DeepSeek-V3.2 | 35.7 | 15.4 | 45.8 | 9.6 | 21.5 | 15.0 | 27.6 | 22.9 | 24.2 |
+| Kimi-K2-Thinking | 30.0 | 7.1 | 51.0 | 12.2 | 15.4 | 8.2 | 39.6 | 15.7 | 22.4 |
+| Qwen3-30B (Think) | 22.0 | 5.4 | 51.9 | 6.7 | 18.3 | 7.6 | 25.7 | 15.7 | 19.1 |
+| Qwen3-235B (Inst.) | 28.0 | 4.7 | 38.1 | 9.3 | 15.7 | 7.8 | 23.8 | 17.7 | 18.1 |
+| Qwen3-4B (Think) | 24.0 | 3.8 | 38.4 | 5.6 | 5.8 | 7.1 | 21.9 | 15.8 | 15.3 |
+
+### Public split:
+We release 60% of the benchmark samples in the public split. For completeness, we present the evaluation results limited to the public split samples below:
+
+| Model | Teams | CSM | Email | ITSM | Calendar | HR | Drive | Hybrid | **Avg.** |
+|-------|:-----:|:---:|:-----:|:----:|:--------:|:--:|:-----:|:------:|:--------:|
+| ***Closed Source Models*** | | | | | | | | | |
+| Claude Opus 4.5 | 50.8 | 29.7 | 47.8 | 28.2 | 41.0 | 32.4 | 46.9 | 30.7 | 36.6 |
+| Gemini-3-Flash | 50.8 | 25.7 | 47.8 | 26.2 | 23.0 | 17.6 | 53.1 | 22.7 | 31.2 |
+| GPT-5.2 (High) | 27.9 | 28.7 | 52.2 | 22.3 | 34.4 | 22.5 | 37.5 | 20.5 | 29.4 |
+| Claude Sonnet 4.5 | 54.1 | 15.8 | 46.3 | 22.3 | 36.1 | 22.5 | 54.7 | 25.0 | 31.7 |
+| GPT-5 | 23.0 | 30.7 | 55.2 | 18.4 | 37.7 | 16.7 | 34.4 | 21.6 | 28.1 |
+| Gemini-3-Pro | 45.9 | 21.8 | 29.9 | 24.3 | 24.6 | 14.7 | 42.2 | 23.9 | 26.7 |
+| GPT-5.2 (Low) | 24.6 | 17.8 | 41.8 | 7.8 | 26.2 | 6.9 | 23.4 | 20.5 | 19.3 |
+| GPT-5-Mini | 23.0 | 16.8 | 52.2 | 5.8 | 31.1 | 6.9 | 21.9 | 21.8 | 22.0 |
+| ***Open Source Models*** | | | | | | | | | |
+| DeepSeek-V3.2 (High) | 41.0 | 12.9 | 44.8 | 18.4 | 21.3 | 19.6 | 37.5 | 23.9 | 25.5 |
+| GPT-OSS-120B (High) | 37.7 | 19.8 | 43.3 | 6.8 | 24.6 | 17.6 | 45.3 | 19.3 | 24.4 |
+| Kimi-K2-Thinking | 29.5 | 6.9 | 46.3 | 15.5 | 11.5 | 8.8 | 32.8 | 12.5 | 18.5 |
+| Qwen3-30B (Think) | 21.3 | 5.0 | 53.7 | 8.7 | 18.0 | 8.8 | 26.6 | 11.4 | 17.0 |
+| Qwen3-235B (Inst.) | 29.5 | 4.0 | 41.8 | 10.7 | 23.0 | 14.7 | 31.2 | 19.3 | 19.6 |
+| Qwen3-4B (Think) | 23.0 | 3.0 | 37.3 | 5.8 | 4.9 | 7.8 | 23.4 | 15.9 | 13.6 |
+---
+
+## 📚 Citation
+
+```bibtex
+@misc{malay2026enterpriseopsgymenvironmentsevaluationsstateful,
+      title={EnterpriseOps-Gym: Environments and Evaluations for Stateful Agentic Planning and Tool Use in Enterprise Settings}, 
+      author={Shiva Krishna Reddy Malay and Shravan Nayak and Jishnu Sethumadhavan Nair and Sagar Davasam and Aman Tiwari and Sathwik Tejaswi Madhusudhan and Sridhar Krishna Nemala and Srinivas Sunkara and Sai Rajeswar},
+      year={2026},
+      eprint={2603.13594},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2603.13594}, 
+}
+```

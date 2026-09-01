@@ -80,6 +80,29 @@ class LLMClient:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
+
+            
+            # if self.provider == "anthropic":
+            #     from langchain_anthropic import ChatAnthropic
+
+            #     # 注入自定义 API Endpoint 和 Bearer 认证头
+            #     anthropic_kwargs = {
+            #         "model": self.model,
+            #         "anthropic_api_key": self.api_key,
+            #         "temperature": self.temperature,
+            #         "max_tokens": self.max_tokens,
+            #         "timeout": 60.0,       # 请求超过 60 秒强制超时，不再死等！
+            #         "max_retries": 2,      # 超时或网络抖动时自动重试 2 次
+            #     }
+            #     if self.custom_api_endpoint:
+            #         anthropic_kwargs["anthropic_api_url"] = self.custom_api_endpoint
+            #     # 针对国内中转站强制注入 Authorization: Bearer 头
+            #     anthropic_kwargs["default_headers"] = {
+            #         "Authorization": f"Bearer {self.api_key}"
+            #     }
+
+            #     self.llm = ChatAnthropic(**anthropic_kwargs)
+
             elif self.provider == "aws_bedrock":
                 from langchain_aws import ChatBedrockConverse
 
@@ -205,6 +228,36 @@ class LLMClient:
                     },
                     **({"top_p": self.top_p} if self.top_p is not None else {}),
                 )
+
+            elif self.provider == "ustc":
+                from langchain_anthropic import ChatAnthropic
+
+                # 1. 处理 Endpoint 格式 (去除结尾的 /v1)
+                base_url = self.custom_api_endpoint
+                if base_url:
+                    base_url = base_url.rstrip("/")
+                    if base_url.endswith("/v1"):
+                        base_url = base_url[:-3]
+
+                anthropic_kwargs = {
+                    "model": self.model,
+                    "anthropic_api_key": self.api_key or "placeholder",
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens or 4096,
+                    "timeout": 300.0,       # ⬅️ 300秒超时，SDK 会自动传递给底层 HTTP client
+                    "max_retries": 2,
+                }
+
+                if base_url:
+                    anthropic_kwargs["anthropic_api_url"] = base_url
+
+                # 2. 注入 Bearer 鉴权头
+                if self.api_key:
+                    anthropic_kwargs["default_headers"] = {
+                        "Authorization": f"Bearer {self.api_key}"
+                    }
+
+                self.llm = ChatAnthropic(**anthropic_kwargs)
 
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.provider}")
