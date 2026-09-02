@@ -175,10 +175,16 @@ class ToolRouter:
         k_final: int = DEFAULT_TOP_K,
         min_score: float = 0.05,
     ):
+        if k_candidate < 1 or k_final < 1:
+            raise ValueError(f"k_candidate/k_final must be >= 1, got {k_candidate}/{k_final}")
         self.tools = tools
         self.by_name = {t["name"]: t for t in tools}
         docs = {t["name"]: build_tool_signature(t) for t in tools}
         self.index = TFIDFIndex(docs)
+        # k_candidate(LLM 精排的候选输入池)与 k_final(粗筛输出数)解耦:
+        # 二者可独立,k_final > k_candidate 在纯粗筛/饱和曲线实验里合法(输出给足
+        # k_final,精排阶段才在 k_candidate 候选内收敛)。旧实现 hits[:k_final] 从
+        # 候选池截取,导致 k_final > k_candidate 时静默截断(实测 80 只给 30)。
         self.k_candidate = k_candidate
         self.k_final = k_final
         self.min_score = min_score
@@ -193,18 +199,19 @@ class ToolRouter:
                 "top_score": raw[0][0] if raw else 0.0,
                 "subset_size": len(self.tools),
             }
-        # 只读工具地板分 + 取候选
+        # 只读工具地板分 + 全量排序(不做 k_candidate 截断,见 __init__ 注释)
         boosted = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n)
                    for s, n in raw]
         boosted.sort(reverse=True)
-        hits = boosted[: self.k_candidate]
-        subset = [self.by_name[n] for _, n in hits[: self.k_final]]
+        cand = boosted[: self.k_candidate]                       # ③ 精排候选输入池
+        out = boosted[: self.k_final]                            # 粗筛输出(≥候选时给足)
+        subset = [self.by_name[n] for _, n in out]
         return subset, {
-            "candidate_size": len(hits),
-            "candidate_names": [n for _, n in hits],  # ③ 精排的候选池(≤30)
+            "candidate_size": len(cand),
+            "candidate_names": [n for _, n in cand],
             "subset_size": len(subset),
             "top_score": raw[0][0],
-            "bottom_score": hits[min(self.k_final, len(hits)) - 1][0],
+            "bottom_score": out[-1][0] if out else 0.0,
         }
 
 

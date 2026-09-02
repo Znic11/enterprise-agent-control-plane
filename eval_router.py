@@ -4,6 +4,10 @@
     python eval_router.py [--data_dir data/revised] [--top_k 20]
     python eval_router.py --pool_mode cross          # 模拟 512 工具跨域全池
     python eval_router.py --tools tools_dump.json    # 真实全量工具池(gym dump)
+    python eval_router.py --pool_mode gym --tools tools_dump.json
+                                                     # 按任务 gym_servers_config 建池:
+                                                     # 任务可用池 = 挂载 server 的域池并集
+                                                     # (混合域任务天然支持,域信号零泄露)
     python eval_router.py --llm_config conf/llm/mini.json
                                                      # 同一轮跑『粗筛』vs『粗筛+LLM精排』
                                                      # 两组消融对照(需 langchain 依赖与 key;
@@ -37,9 +41,75 @@ import os
 import sys
 import time
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from benchmark.tool_router import batch_route, route
+
+# server 名 → dump _domain 的映射(任务 gym_servers_config 里写的是挂载哪些
+# MCP server;这是执行器运行时本来就有的配置,不是答案泄露)。本地样例:
+#   sn-csm-server → csm | gym-itsm-mcp → itsm
+# 远程完整环境的 server 名需按 RUN_GUIDE 核对,必要时补映射。
+SERVER_DOMAIN_HINTS: Dict[str, str] = {
+    "csm": "csm",
+    "itsm": "itsm",
+    "email": "email",
+    "hr": "hr",
+    "teams": "teams",
+    "drive": "drive",
+    "calendar": "calendar",
+}
+
+
+def resolve_server_domain(server_name: str) -> Optional[str]:
+    """把 mcp_server_name 解析成 dump 里的 _domain 标签。
+
+    规则:先查精确映射表;再尝试子串匹配(sn-csm-server / gym-itsm-mcp 里
+    找已知域关键字),避免远程 server 命名变体(如 sn-*-server)逐个手写。
+    """
+    if not server_name:
+        return None
+    low = server_name.lower()
+    for key, dom in SERVER_DOMAIN_HINTS.items():
+        if key in low:
+            return dom
+    return None
+
+
+def build_gym_pools(
+    tasks: List[Dict[str, Any]], by_domain: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """按任务 gym_servers_config 建池:pool_key = 挂载 server 的域集合。
+
+    域信号来自任务配置(执行器运行时挂哪些 server),零泄露;混合域任务
+    (gym_servers_config 挂多个 server)取这些域的并集 —— 这是『先确定
+    领域再筛工具』的正确实现:不是用 TF-IDF/lexicon 猜域,而是直接读
+    任务声明。跨域同名工具按 (name,_domain) 全保留(与 dump 一致)。
+    """
+    pools: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tasks:
+        doms = []
+        for srv in t.get("gym") or []:
+            d = resolve_server_domain(srv)
+            if d and d not in doms:
+                doms.append(d)
+        # 解析不到任何域(未知 server 名)→ 退回任务文件夹域,并保持 name 去重
+        if not doms and t.get("domain"):
+            doms = [t["domain"]]
+        key = "|".join(sorted(doms)) or "unknown"
+        if key not in pools:
+            # 多域并集 + 按 name 去重(先出现者优先,与 executor DUPLICATE 行为一致;
+            # ToolRouter.by_name/TFIDFIndex 均按 name 建索引,同名只能保留一份)
+            pool: List[Dict[str, Any]] = []
+            seen: set = set()
+            for d in doms:
+                for tool in by_domain.get(d, []):
+                    if tool["name"] not in seen:
+                        seen.add(tool["name"])
+                        pool.append(tool)
+            pools[key] = pool
+        t["pool_key"] = key
+        t["_pool_domains"] = doms
+    return pools
 
 # 干扰工具(来自其他域的典型企业工具,注入域内池以增加逼真度;仅 name-only 池用)
 NOISE_TOOLS = [
@@ -106,19 +176,27 @@ def _eval_one_variant(
     verbose: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """对全部任务跑一遍指定路由配置(batch_route:索引建一次+LLM 并发),
-    返回 {domain, ALL} 聚合指标。"""
-    # 按域分组(域模式各域池不同;batch_route 的语义与 route() 逐任务一致)
-    dom_texts: Dict[str, List[str]] = defaultdict(list)
+    返回 {domain, ALL} 聚合指标。
+
+    分组键 = 任务级 pool_key(默认=文件夹域;gym 模式=任务挂载 server 的域
+    并集)。同一 pool_key 的任务共享一个池 → batch_route 索引只建一次;
+    不同 pool_key(混合域任务)分池各自跑,语义与 route() 逐任务一致。
+    """
+    # 按任务级 pool_key 分组(各任务自带可用池;batch_route 按池批量)
+    pool_texts: Dict[str, List[str]] = defaultdict(list)
+    pool_of: Dict[str, Dict[str, Any]] = {}
     for t in tasks:
-        dom_texts[t["domain"]].append(t["user_prompt"])
+        key = t.get("pool_key") or t["domain"]
+        pool_texts[key].append(t["user_prompt"])
+        pool_of[key] = pools.get(key) or pools.get(t["domain"]) or pools[t["domain"]]
 
     results_by_prompt: Dict[str, Any] = {}
-    for dom, texts in dom_texts.items():
+    for key, texts in pool_texts.items():
         last = [0]
-        def _progress(i: int, n: int, dom=dom):
-            print(f"\r  [{dom}] LLM 精排 {i}/{n} ", end="", flush=True)
+        def _progress(i: int, n: int, key=key):
+            print(f"\r  [{key}] LLM 精排 {i}/{n} ", end="", flush=True)
         pairs = asyncio.run(batch_route(
-            texts, pools[dom], top_k=top_k,
+            texts, pool_of[key], top_k=top_k,
             llm_call_fn_async=llm_call_async, concurrency=concurrency,
             progress_fn=_progress if llm_call_async else None,
         ))
@@ -296,12 +374,15 @@ def _print_agg_row(label: str, a: Dict[str, float], top_k: int) -> None:
 def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
     """打印第一个任务的路由明细,便于人工核对漏检。"""
     t = tasks[0]
-    result = route(t["user_prompt"], pools[t["domain"]], top_k=top_k)
+    pool = pools[t.get("pool_key") or t["domain"]]
+    result = route(t["user_prompt"], pool, top_k=top_k)
     pred = set(result.selected)
     unreach = t.get("unreachable", set())
     miss = (t["selected_tools"] - pred) - unreach
+    doms = t.get("_pool_domains") or [t["domain"]]
     print("=== 样例路由核对 ===")
     print(f"任务: {t['user_prompt'][:140]}...")
+    print(f"可用池域: {doms}(共 {len(pool)} 工具)")
     print(f"ground truth({len(t['selected_tools'])}): {sorted(t['selected_tools'])}")
     if unreach:
         print(f"⚠️ 其中 {len(unreach)} 个不在可用池中(跨域引用,路由器不可能选中): {sorted(unreach)}")
@@ -354,8 +435,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Offline tool router evaluation (unified)")
     ap.add_argument("--data_dir", default="data/revised")
     ap.add_argument("--top_k", type=int, default=20)
-    ap.add_argument("--pool_mode", choices=["domain", "cross"], default="domain",
-                    help="domain=每域独立池(默认,贴近生产);cross=跨域合并池(模拟无域锁定的 512 工具空间)")
+    ap.add_argument("--pool_mode", choices=["domain", "cross", "gym"], default="domain",
+                    help="domain=每域独立池(默认,贴近生产);cross=跨域合并池(模拟无域锁定的"
+                         "512 工具空间);gym=按任务 gym_servers_config 建池(任务挂哪个 server"
+                         "就用哪几个域的池并集,混合域天然支持;域信号来自任务配置,零泄露)")
     ap.add_argument("--tools", default=None,
                     help="真实全量工具池 JSON(list[{name, description, input_schema}]);提供时忽略近似池")
     ap.add_argument("--llm_config", default=None,
@@ -370,53 +453,102 @@ def main() -> None:
         print(f"未找到任务: {args.data_dir}")
         sys.exit(1)
 
+    by_domain: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    real = None
     if args.tools:
         real = load_real_tools(args.tools)
-        if args.pool_mode == "domain" and any("_domain" in t for t in real):
-            # dump 带来源域标记:按真实域分池(池大小=真实域内工具数,最贴生产口径)
-            pools = defaultdict(list)
+        if any("_domain" in t for t in real):
             for t in real:
-                pools[t.get("_domain")].append(t)
-            pools = dict(pools)
-            print(f"使用真实工具池(按域分池): " +
-                  ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
-        else:
-            # 跨域重名工具:全量池按 name 去重(先出现者优先,与 executor 运行时一致),
-            # 避免 ToolRouter.by_name 索引相互覆盖
+                by_domain[t.get("_domain")].append(t)
+            by_domain = dict(by_domain)
+            print(f"真实工具池按域分池: " +
+                  ", ".join(f"{d}={len(p)}" for d, p in sorted(by_domain.items())))
+
+    if args.pool_mode == "gym":
+        # 生产口径:执行器只挂任务 gym_servers_config 声明的 server → 可用池 =
+        # 这些 server 的域池并集。这是『先定域再筛』的正确实现:域不靠 TF-IDF/
+        # lexicon 猜(猜错硬锁比不锁更差,实测 top-1 词法命中率仅 77%),直接读
+        # 任务配置 —— 运行时零泄露、混合域天然覆盖。
+        if not real:
+            print("⚠️ pool_mode=gym 需要真实工具池(--tools tools_dump.json),"
+                  "否则无从按域取工具;回退近似域内池")
+            pools = {d: build_domain_pool(tasks, d) for d in {t["domain"] for t in tasks}}
+        elif not by_domain:
+            print("⚠️ dump 无 _domain 标记,gym 模式退化为跨域全池(name 去重)")
             seen, dedup = set(), []
             for t in real:
                 if t["name"] not in seen:
                     seen.add(t["name"])
                     dedup.append(t)
-            print(f"使用真实全量工具池: {len(real)} 条 -> 按 name 去重后 {len(dedup)} 个"
-                  f"(跨域重名 {len(real) - len(dedup)} 个,官方各域容器本就存在同名工具)")
-            real = dedup
-            pools = {d: real for d in {t["domain"] for t in tasks}}
+            pools = {d: dedup for d in {t["domain"] for t in tasks}}
+            pools["ALL"] = dedup
+            for t in tasks:
+                t["pool_key"] = "ALL"
+                t["_pool_domains"] = list(t["gym"]) or [t["domain"]]
+        else:
+            pools = build_gym_pools(tasks, by_domain)
+        print("使用 gym 配置域池(pool_mode=gym)")
+        pool_keys = sorted({t.get("pool_key", t["domain"]) for t in tasks})
+        for k in pool_keys:
+            if k in pools:
+                print(f"  [{k}] {len(pools[k])} tools")
+    elif args.tools and args.pool_mode == "domain" and by_domain:
+        # dump 带来源域标记:任务按文件夹域取对应真实域池(最贴生产口径)
+        pools = dict(by_domain)
         missing = {t["domain"] for t in tasks} - set(pools)
         if missing:
-            print(f"⚠️ dump 中缺少域 {sorted(missing)},这些域将使用全量池")
+            print(f"⚠️ dump 中缺少域 {sorted(missing)},这些域将使用近似池")
             for d in missing:
-                pools[d] = real
+                pools[d] = build_domain_pool(tasks, d)
+        for t in tasks:
+            t["pool_key"] = t["domain"]
+            t["_pool_domains"] = [t["domain"]]
+        print(f"使用真实工具池(任务按文件夹域取池,共 {len(tasks)} 任务)")
+    elif args.tools:
+        # 跨域重名工具:全量池按 name 去重(先出现者优先,与 executor 运行时一致),
+        # 避免 ToolRouter.by_name 索引相互覆盖
+        seen, dedup = set(), []
+        for t in real:
+            if t["name"] not in seen:
+                seen.add(t["name"])
+                dedup.append(t)
+        print(f"使用真实全量工具池: {len(real)} 条 -> 按 name 去重后 {len(dedup)} 个"
+              f"(跨域重名 {len(real) - len(dedup)} 个,官方各域容器本就存在同名工具)")
+        pools = {d: dedup for d in {t["domain"] for t in tasks}}
+        pools["ALL"] = dedup  # pool_key="ALL" 的任务走这里
+        for t in tasks:
+            t["pool_key"] = "ALL"
+            t["_pool_domains"] = [t["domain"]]
     elif args.pool_mode == "cross":
         pool = build_cross_pool(tasks)
         print(f"使用近似跨域全池: {len(pool)} tools(pool_mode=cross)")
         pools = {d: pool for d in {t["domain"] for t in tasks}}
+        pools["ALL"] = pool
+        for t in tasks:
+            t["pool_key"] = "ALL"
+            t["_pool_domains"] = [t["domain"]]
     else:
         pools = {d: build_domain_pool(tasks, d) for d in {t["domain"] for t in tasks}}
         print("使用近似域内池(pool_mode=domain): " +
               ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
+        for t in tasks:
+            t["pool_key"] = t["domain"]
+            t["_pool_domains"] = [t["domain"]]
     print(f"共 {len(tasks)} 任务, top_k={args.top_k}\n")
 
-    # 可达性核对:GT 工具必须存在于该任务的可用池,否则任何路由器都不可能选中。
-    # 本地数据已知问题:gym_servers_config 只挂单 server,但 GT 引用了其他域容器上的工具。
+    # 可达性核对:GT 工具必须存在于该任务的可用池(pool_key 对应池),
+    # 否则任何路由器都不可能选中。gym 模式下跨域 GT 引用会因多域并集而可达,
+    # 这正是生产 executor 的行为(挂多个 server → 工具全部可用)。
     unreach_total = 0
     for t in tasks:
-        pool_names = {x["name"] for x in pools[t["domain"]]}
+        key = t.get("pool_key") or t["domain"]
+        pool = pools.get(key) or pools.get(t["domain"]) or next(iter(pools.values()))
+        pool_names = {x["name"] for x in pool}
         t["unreachable"] = t["selected_tools"] - pool_names
         t["reachable_tools"] = t["selected_tools"] & pool_names
         unreach_total += len(t["unreachable"])
     if unreach_total:
-        print(f"⚠️ {unreach_total} 个 GT 工具不在对应域池中(跨域引用,GT 在其他域的容器上):"
+        print(f"⚠️ {unreach_total} 个 GT 工具不在对应可用池中(跨域引用,GT 在其他域的容器上):"
               f"这些工具任何路由器都选不到,以下 recall/full_cov 按『可达 GT』口径计算\n")
 
     if args.llm_config:
