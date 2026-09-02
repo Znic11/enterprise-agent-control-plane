@@ -395,12 +395,20 @@ def route(
     top_k: int = DEFAULT_TOP_K,
     llm_call_fn: Optional[Callable[[str], str]] = None,
     prefer_llm: bool = False,
+    rerank_mode: str = "strict",
 ) -> RouteResult:
     """统一路由入口:TF-IDF 粗筛 →(可选)LLM 精排 → 兜底。
 
     - 粗筛置信度低 → 回退全量工具(method="full_fallback")
     - prefer_llm 且提供了 llm_call_fn → 在粗筛候选(≤30)上 LLM 精排;
       LLM 失败或选中 <5 个 → 回退粗筛 top-k 子集
+    - rerank_mode:
+        "strict" —— LLM 输出即最终(method="tfidf+llm"),噪声最少,
+                  但 LLM 砍错会丢必需工具(实测 reasoner 过度截断)
+        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method="tfidf+llm+union"),
+                  精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛;
+                  代价是暴露数 ≈ 粗筛 top-k,减噪效果弱于 strict。
+                  适合『宁缺毋滥、任务不能因缺工具失败』的生产口径。
     - 工具池为空 → selected=[],method="empty"(上层应视为配置错误)
     """
     if not all_tools:
@@ -439,8 +447,25 @@ def route(
                 f"keeping TF-IDF subset"
             )
         else:
-            subset = [router.by_name[n] for n in llm_names if n in router.by_name]
-            method = "tfidf+llm"
+            if rerank_mode == "union":
+                # 保底融合:精排选中的 ∪ 粗筛 top-k(按粗筛候选顺序去重)。
+                # 精排只能"加回/排序",不能砍掉粗筛已召回的候选 —— 确保
+                # 精排阶段不会因过度截断丢失必需工具(实测 23 个被砍工具
+                # 中大量是 GT 必需,且与噪声在粗筛分数上不可分,纯阈值无法救回)。
+                llm_set = set(llm_names)
+                merged = [t["name"] for t in subset]
+                for n in llm_names:
+                    if n not in merged:
+                        merged.append(n)
+                subset = [router.by_name[n] for n in merged if n in router.by_name]
+                method = "tfidf+llm+union"
+                logger.info(
+                    f"[ROUTER] union rerank: LLM {len(llm_set)} ∪ coarse {len(merged)} "
+                    f"-> {len(subset)} tools (recall floor = coarse)"
+                )
+            else:  # strict
+                subset = [router.by_name[n] for n in llm_names if n in router.by_name]
+                method = "tfidf+llm"
 
     return RouteResult(
         selected=[t["name"] for t in subset],
@@ -460,6 +485,7 @@ async def batch_route(
     llm_call_fn_async: Optional[Callable[[str], Any]] = None,
     concurrency: int = 8,
     progress_fn: Optional[Callable[[int, int], None]] = None,
+    rerank_mode: str = "strict",
 ) -> Dict[str, RouteResult]:
     """批量路由:TF-IDF 索引只建一次 + LLM 精排并发执行(语义与 route() 一致)。
 
@@ -468,6 +494,8 @@ async def batch_route(
 
     回退规则与 route() 保持一致(改动需两处同步):
       置信度低 → full_fallback(全量);LLM 失败或选中 < MIN_LLM_SELECTED → 粗筛子集。
+    rerank_mode 与 route() 同语义:"strict"=LLM 输出即最终;"union"=与粗筛
+    top-k 取并集保底(recall ≥ 纯粗筛,精排永不砍掉粗筛已召回的必需工具)。
     """
     import asyncio
 
@@ -514,11 +542,23 @@ async def batch_route(
                 f"keeping TF-IDF subset"
             )
         else:
-            subset = [router.by_name[n] for n in llm_names if n in router.by_name]
-            return task_text, RouteResult(
-                selected=[t["name"] for t in subset], method="tfidf+llm",
-                candidate_size=meta.get("candidate_size", len(subset)),
-                candidate_names=cand_names, **common)
+            if rerank_mode == "union":
+                # 保底融合:与粗筛 subset(top-k)并集,按粗筛顺序 + LLM 补充去重
+                merged = [t["name"] for t in subset]
+                for n in llm_names:
+                    if n not in merged:
+                        merged.append(n)
+                subset = [router.by_name[n] for n in merged if n in router.by_name]
+                return task_text, RouteResult(
+                    selected=[t["name"] for t in subset], method="tfidf+llm+union",
+                    candidate_size=meta.get("candidate_size", len(subset)),
+                    candidate_names=cand_names, **common)
+            else:  # strict
+                subset = [router.by_name[n] for n in llm_names if n in router.by_name]
+                return task_text, RouteResult(
+                    selected=[t["name"] for t in subset], method="tfidf+llm",
+                    candidate_size=meta.get("candidate_size", len(subset)),
+                    candidate_names=cand_names, **common)
 
         return task_text, RouteResult(  # LLM 失败/过少 → 回退粗筛子集
             selected=[t["name"] for t in subset], method="tfidf",

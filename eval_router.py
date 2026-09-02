@@ -174,6 +174,7 @@ def _eval_one_variant(
     llm_call_async=None,
     concurrency: int = 8,
     verbose: bool = True,
+    rerank_mode: str = "strict",
 ) -> Dict[str, Dict[str, float]]:
     """对全部任务跑一遍指定路由配置(batch_route:索引建一次+LLM 并发),
     返回 {domain, ALL} 聚合指标。
@@ -199,6 +200,7 @@ def _eval_one_variant(
             texts, pool_of[key], top_k=top_k,
             llm_call_fn_async=llm_call_async, concurrency=concurrency,
             progress_fn=_progress if llm_call_async else None,
+            rerank_mode=rerank_mode,
         ))
         if llm_call_async:
             print()
@@ -259,11 +261,18 @@ def evaluate(
     top_k: int,
     llm_config_path: str = None,
     concurrency: int = 8,
+    rerank_mode: str = "strict",
 ) -> None:
     """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_config_path 时只跑粗筛)。
 
     粗筛先跑先出结果;langchain 导入与 client 初始化只在第二轮前发生
     (启动不再被依赖加载阻塞)。LLM 调用并发执行(--concurrency 限流)。
+
+    rerank_mode:
+        "strict" —— LLM 输出即最终(默认,噪声最少,但 LLM 砍错会丢必需工具);
+        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method=tfidf+llm+union),
+                  精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛,
+                  对应『召回优先 + 任务不能因缺工具失败』的生产口径。
     """
     verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
     results = {}
@@ -277,6 +286,8 @@ def evaluate(
     print(f"(粗筛耗时 {time.perf_counter() - t0:.2f}s)")
 
     if llm_config_path is None:
+        if rerank_mode != "strict":
+            print(f"(提示: --rerank_mode {rerank_mode} 仅对 LLM 精排生效,本次未提供 --llm_config)")
         print_variant("TF-IDF 粗筛", results["TF-IDF 粗筛"], top_k, verbose)
         _print_targets(top_k)
         return
@@ -287,16 +298,17 @@ def evaluate(
     llm_call_async, latencies = build_llm_call_fn(llm_config_path)
     print(f"(加载耗时 {time.perf_counter() - t0:.2f}s)")
 
-    print(f"\n{'#' * 66}\n# 变体: 粗筛 + LLM 精排(并发={concurrency})\n{'#' * 66}")
+    second_name = "粗筛 + LLM 精排" if rerank_mode == "strict" else f"粗筛 + LLM 精排(union)"
+    print(f"\n{'#' * 66}\n# 变体: {second_name}(并发={concurrency})\n{'#' * 66}")
     t0 = time.perf_counter()
-    results["粗筛 + LLM 精排"], by_prompt_all["粗筛 + LLM 精排"] = _eval_one_variant(
+    results[second_name], by_prompt_all[second_name] = _eval_one_variant(
         tasks, pools, top_k, llm_call_async=llm_call_async,
-        concurrency=concurrency, verbose=verbose)
+        concurrency=concurrency, verbose=verbose, rerank_mode=rerank_mode)
     elapsed = time.perf_counter() - t0
-    print_variant("粗筛 + LLM 精排", results["粗筛 + LLM 精排"], top_k, verbose)
+    print_variant(second_name, results[second_name], top_k, verbose)
 
     _print_miss_attribution(tasks, by_prompt_all["TF-IDF 粗筛"],
-                            by_prompt_all["粗筛 + LLM 精排"], verbose)
+                            by_prompt_all[second_name], verbose)
 
     if latencies:
         lat = sorted(latencies)
@@ -307,8 +319,8 @@ def evaluate(
 
     # 消融对照
     a1 = results["TF-IDF 粗筛"]["ALL"]
-    a2 = results["粗筛 + LLM 精排"]["ALL"]
-    print(f"\n=== 消融对照(粗筛 -> 粗筛+LLM精排)===")
+    a2 = results[second_name]["ALL"]
+    print(f"\n=== 消融对照(粗筛 -> {second_name})===")
     print(f"  recall@{top_k}: {a1['tp']/a1['n_sel']:.1%} -> {a2['tp']/a2['n_sel']:.1%} "
           f"({a2['tp']/a2['n_sel'] - a1['tp']/a1['n_sel']:+.1%})")
     print(f"  precision@{top_k}: {a1['tp']/a1['n_pred']:.1%} -> {a2['tp']/a2['n_pred']:.1%} "
@@ -319,15 +331,19 @@ def evaluate(
 def _print_miss_attribution(tasks, coarse_by_prompt, llm_by_prompt, verbose: bool) -> None:
     """漏检归因:区分『粗筛没捞进来』和『粗筛捞了但被 LLM 精排砍掉』。
 
-    仅对 method=tfidf+llm 的任务可精确二分(其 candidate_names = 精排输入);
-    回退任务(超时/低选数)漏检全部记粗筛侧,并单独标注。
+    仅对 method=tfidf+llm / tfidf+llm+union 的任务可精确二分(其 candidate_names
+    = 精排输入);回退任务(超时/低选数)漏检全部记粗筛侧,并单独标注。
+
+    union 模式下 selected ⊇ 粗筛 top-k,故『精排砍掉』恒为 0(只要 GT 在粗筛
+    候选内就不会丢)—— 归因结果会自然显示漏检全部落在粗筛侧,这正是
+    rerank_mode=union 的预期行为(精排不再制造漏检,只负责加回与排序)。
     """
     print(f"\n=== 漏检归因(粗筛漏选 vs LLM 精排砍掉)===")
     tot_rerank, tot_coarse, n_fallback, n_rerank = 0, 0, 0, 0
     for t in tasks:
         oracle = t.get("reachable_tools", t["selected_tools"])
         lres = llm_by_prompt[t["user_prompt"]]
-        if lres.method != "tfidf+llm":
+        if lres.method not in ("tfidf+llm", "tfidf+llm+union"):
             n_fallback += 1
             miss = oracle - set(lres.selected)
             tot_coarse += len(miss)
@@ -351,7 +367,7 @@ def _print_miss_attribution(tasks, coarse_by_prompt, llm_by_prompt, verbose: boo
           f" | 回退任务 {n_fallback} 个(超时/低选数,未参与精排) | 精排生效 {n_rerank} 个")
     if tot_rerank and tot_rerank > tot_coarse:
         print("  → 漏检主要来自精排过度截断:可调高 ROUTER_PROMPT 工具数下限,"
-              "或精排结果与粗筛 top-k 取并集(召回优先融合)。")
+              "或改用 --rerank_mode union(精排与粗筛 top-k 取并集,召回优先保底)。")
     elif tot_coarse and tot_coarse > tot_rerank:
         print("  → 漏检主要来自粗筛:候选阶段就没捞到,调 top_k/LOOKUP_FLOOR 或查询扩展。")
     elif tot_rerank and tot_coarse:
@@ -446,6 +462,11 @@ def main() -> None:
                          "『粗筛』与『粗筛+LLM精排』两组并输出消融对照。需 langchain 依赖。")
     ap.add_argument("--concurrency", type=int, default=8,
                     help="LLM 精排并发数(默认 8)。网关限流严格时调低,内网网关可调高。")
+    ap.add_argument("--rerank_mode", choices=["strict", "union"], default="strict",
+                    help="LLM 精排结果合成模式:strict=LLM 输出即最终(默认,噪声最少,"
+                         "但 LLM 砍错会丢必需工具);union=精排选中 ∪ 粗筛 top-k 保底"
+                         "(method=tfidf+llm+union),精排不可能砍掉粗筛已召回的必需工具,"
+                         "recall ≥ 纯粗筛 ——『召回优先、任务不因缺工具失败』口径")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
@@ -552,14 +573,15 @@ def main() -> None:
               f"这些工具任何路由器都选不到,以下 recall/full_cov 按『可达 GT』口径计算\n")
 
     if args.llm_config:
-        print(f"已启用 LLM 精排(router LLM: {args.llm_config}, 并发={args.concurrency}),"
-              f"将与纯粗筛做消融对照\n")
+        print(f"已启用 LLM 精排(router LLM: {args.llm_config}, 并发={args.concurrency}, "
+              f"rerank_mode={args.rerank_mode}),将与纯粗筛做消融对照\n")
 
     print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
     print("-" * 96)
     inspect_sample(tasks, pools, args.top_k)
     evaluate(tasks, pools, args.top_k,
-             llm_config_path=args.llm_config, concurrency=args.concurrency)
+             llm_config_path=args.llm_config, concurrency=args.concurrency,
+             rerank_mode=args.rerank_mode)
 
 
 if __name__ == "__main__":
