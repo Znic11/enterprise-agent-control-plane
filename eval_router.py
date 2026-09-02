@@ -175,6 +175,7 @@ def _eval_one_variant(
     concurrency: int = 8,
     verbose: bool = True,
     rerank_mode: str = "strict",
+    candidate_k: Optional[int] = None,
 ) -> Dict[str, Dict[str, float]]:
     """对全部任务跑一遍指定路由配置(batch_route:索引建一次+LLM 并发),
     返回 {domain, ALL} 聚合指标。
@@ -200,7 +201,7 @@ def _eval_one_variant(
             texts, pool_of[key], top_k=top_k,
             llm_call_fn_async=llm_call_async, concurrency=concurrency,
             progress_fn=_progress if llm_call_async else None,
-            rerank_mode=rerank_mode,
+            rerank_mode=rerank_mode, candidate_k=candidate_k,
         ))
         if llm_call_async:
             print()
@@ -262,6 +263,7 @@ def evaluate(
     llm_config_path: str = None,
     concurrency: int = 8,
     rerank_mode: str = "strict",
+    candidate_k: Optional[int] = None,
 ) -> None:
     """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_config_path 时只跑粗筛)。
 
@@ -273,13 +275,18 @@ def evaluate(
         "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method=tfidf+llm+union),
                   精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛,
                   对应『召回优先 + 任务不能因缺工具失败』的生产口径。
+    candidate_k: 喂给 LLM 的候选宽度(默认 max(30, top_k))。union 模式下
+        必须 > top_k 才有意义:候选=输出时(如 top_k=60 默认候选也是 60)
+        LLM 从保底集合里选,union ≡ 纯粗筛,白付延迟(实测 13 任务 0 提升)。
+        推荐 top_k=30 + candidate_k=60:粗筛保底 30,LLM 在 60 候选内
+        增补 30-60 区间的必需工具 → 噪声从 60 压到 ~30-45 且召回不掉。
     """
     verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
     results = {}
     by_prompt_all = {}
 
     # 变体 1:纯粗筛(纯 CPU,毫秒级/任务)
-    print(f"\n{'#' * 66}\n# 变体: TF-IDF 粗筛\n{'#' * 66}")
+    print(f"\n{'#' * 66}\n# 变体: TF-IDF 粗筛(top_k={top_k})\n{'#' * 66}")
     t0 = time.perf_counter()
     results["TF-IDF 粗筛"], by_prompt_all["TF-IDF 粗筛"] = _eval_one_variant(
         tasks, pools, top_k, llm_call_async=None, verbose=verbose)
@@ -299,11 +306,14 @@ def evaluate(
     print(f"(加载耗时 {time.perf_counter() - t0:.2f}s)")
 
     second_name = "粗筛 + LLM 精排" if rerank_mode == "strict" else f"粗筛 + LLM 精排(union)"
+    if candidate_k is not None and candidate_k > top_k and rerank_mode == "union":
+        second_name += f" 保底{top_k}+候选{candidate_k}"
     print(f"\n{'#' * 66}\n# 变体: {second_name}(并发={concurrency})\n{'#' * 66}")
     t0 = time.perf_counter()
     results[second_name], by_prompt_all[second_name] = _eval_one_variant(
         tasks, pools, top_k, llm_call_async=llm_call_async,
-        concurrency=concurrency, verbose=verbose, rerank_mode=rerank_mode)
+        concurrency=concurrency, verbose=verbose, rerank_mode=rerank_mode,
+        candidate_k=candidate_k)
     elapsed = time.perf_counter() - t0
     print_variant(second_name, results[second_name], top_k, verbose)
 
@@ -467,6 +477,11 @@ def main() -> None:
                          "但 LLM 砍错会丢必需工具);union=精排选中 ∪ 粗筛 top-k 保底"
                          "(method=tfidf+llm+union),精排不可能砍掉粗筛已召回的必需工具,"
                          "recall ≥ 纯粗筛 ——『召回优先、任务不因缺工具失败』口径")
+    ap.add_argument("--candidate_k", type=int, default=None,
+                    help="喂给 LLM 的粗筛候选宽度(默认 max(30, top_k),即候选=输出)。"
+                         "union 模式下必须 > top_k 才有意义:如 --top_k 30 --candidate_k 60,"
+                         "粗筛保底 30、LLM 从 60 候选内增补 30-60 区间的必需工具,"
+                         "噪声从 60 压到 ~30-45 且召回不掉;候选=输出时 union ≡ 纯粗筛(白付延迟)")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
@@ -573,15 +588,18 @@ def main() -> None:
               f"这些工具任何路由器都选不到,以下 recall/full_cov 按『可达 GT』口径计算\n")
 
     if args.llm_config:
+        hint = f"rerank_mode={args.rerank_mode}"
+        if args.candidate_k is not None:
+            hint += f", candidate_k={args.candidate_k}(LLM 候选>输出才有增补空间)"
         print(f"已启用 LLM 精排(router LLM: {args.llm_config}, 并发={args.concurrency}, "
-              f"rerank_mode={args.rerank_mode}),将与纯粗筛做消融对照\n")
+              f"{hint}),将与纯粗筛做消融对照\n")
 
     print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
     print("-" * 96)
     inspect_sample(tasks, pools, args.top_k)
     evaluate(tasks, pools, args.top_k,
              llm_config_path=args.llm_config, concurrency=args.concurrency,
-             rerank_mode=args.rerank_mode)
+             rerank_mode=args.rerank_mode, candidate_k=args.candidate_k)
 
 
 if __name__ == "__main__":

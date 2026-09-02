@@ -396,26 +396,33 @@ def route(
     llm_call_fn: Optional[Callable[[str], str]] = None,
     prefer_llm: bool = False,
     rerank_mode: str = "strict",
+    candidate_k: Optional[int] = None,
 ) -> RouteResult:
     """统一路由入口:TF-IDF 粗筛 →(可选)LLM 精排 → 兜底。
 
     - 粗筛置信度低 → 回退全量工具(method="full_fallback")
-    - prefer_llm 且提供了 llm_call_fn → 在粗筛候选(≤30)上 LLM 精排;
+    - prefer_llm 且提供了 llm_call_fn → 在粗筛候选上 LLM 精排;
       LLM 失败或选中 <5 个 → 回退粗筛 top-k 子集
     - rerank_mode:
         "strict" —— LLM 输出即最终(method="tfidf+llm"),噪声最少,
                   但 LLM 砍错会丢必需工具(实测 reasoner 过度截断)
         "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method="tfidf+llm+union"),
-                  精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛;
-                  代价是暴露数 ≈ 粗筛 top-k,减噪效果弱于 strict。
-                  适合『宁缺毋滥、任务不能因缺工具失败』的生产口径。
+                  精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛。
+                  注意:减噪/增补效果取决于 candidate_k > top_k —— 若候选
+                  与输出同宽(默认 max(30,top_k)=top_k 时),LLM 只能从保底
+                  集合里选,union ≡ 纯粗筛(no-op,白付延迟)。要发挥精排
+                  价值请显式传 candidate_k(如 top_k=30, candidate_k=60):
+                  粗筛保底前 30,LLM 在 60 候选里把 30-60 区间的必需工具捞回。
+    - candidate_k:喂给 LLM 的候选宽度(粗筛前 N 个);默认 max(30, top_k),
+      与输出 top_k 同宽。union 模式下应传大于 top_k 的值以获得增补空间。
     - 工具池为空 → selected=[],method="empty"(上层应视为配置错误)
     """
     if not all_tools:
         logger.warning("route() called with an empty tool pool")
         return RouteResult(selected=[], method="empty", full_tool_count=0, task_text=task_text)
 
-    router = ToolRouter(all_tools, k_candidate=max(DEFAULT_K_CANDIDATE, top_k), k_final=top_k)
+    k_cand = candidate_k if candidate_k else max(DEFAULT_K_CANDIDATE, top_k)
+    router = ToolRouter(all_tools, k_candidate=k_cand, k_final=top_k)
     subset, meta = router.route(task_text)
     top_score = meta.get("top_score", 0.0)
 
@@ -486,6 +493,7 @@ async def batch_route(
     concurrency: int = 8,
     progress_fn: Optional[Callable[[int, int], None]] = None,
     rerank_mode: str = "strict",
+    candidate_k: Optional[int] = None,
 ) -> Dict[str, RouteResult]:
     """批量路由:TF-IDF 索引只建一次 + LLM 精排并发执行(语义与 route() 一致)。
 
@@ -496,6 +504,9 @@ async def batch_route(
       置信度低 → full_fallback(全量);LLM 失败或选中 < MIN_LLM_SELECTED → 粗筛子集。
     rerank_mode 与 route() 同语义:"strict"=LLM 输出即最终;"union"=与粗筛
     top-k 取并集保底(recall ≥ 纯粗筛,精排永不砍掉粗筛已召回的必需工具)。
+    candidate_k 与 route() 同语义:LLM 候选宽度,默认 max(30, top_k);
+    union 模式下传大于 top_k 的值(如 top_k=30, candidate_k=60),LLM 才能
+    增补粗筛 top-k 之外的候选工具(否则候选=输出,union ≡ 纯粗筛)。
     """
     import asyncio
 
@@ -504,7 +515,8 @@ async def batch_route(
         return {t: RouteResult(method="empty", task_text=t) for t in task_texts}
 
     # ① 粗筛:索引建一次,纯 CPU,毫秒级/任务
-    router = ToolRouter(all_tools, k_candidate=max(DEFAULT_K_CANDIDATE, top_k), k_final=top_k)
+    k_cand = candidate_k if candidate_k else max(DEFAULT_K_CANDIDATE, top_k)
+    router = ToolRouter(all_tools, k_candidate=k_cand, k_final=top_k)
     coarse = {t: router.route(t) for t in task_texts}
 
     # ② 精排:并发(信号量限流),网关延迟被并发摊平
