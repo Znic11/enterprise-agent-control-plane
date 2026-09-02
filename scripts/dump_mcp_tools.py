@@ -24,9 +24,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from benchmark.mcp_client import MCPClient  # noqa: E402
-
-
 def load_existing(path: str) -> list:
     if not os.path.exists(path):
         return []
@@ -37,7 +34,30 @@ def load_existing(path: str) -> list:
     return data if isinstance(data, list) else []
 
 
+def merge_tools(existing: list, new_tools: list, domain: str) -> list:
+    """合并新 dump 的工具进已有列表。
+
+    合并键 = (name, _domain):同域重复跑覆盖本域旧条目;
+    不同域的同名工具各自保留(官方各域容器确实存在重名工具,
+    按 name 全局去重会覆盖先 dump 域的条目并污染 _domain 标签)。
+    """
+    merged = {(t.get("_domain"), t["name"]): t
+              for t in existing if isinstance(t, dict) and t.get("name")}
+    for t in new_tools:
+        entry = {
+            "name": t.get("name"),
+            "description": t.get("description", ""),
+            "input_schema": t.get("inputSchema") or t.get("input_schema") or {},
+            "_domain": domain,
+        }
+        merged[(domain, entry["name"])] = entry
+    return sorted(merged.values(), key=lambda x: (x.get("_domain", ""), x["name"]))
+
+
 def dump_one(url: str, domain: str, out_path: str) -> int:
+    # 惰性导入:httpx 仅在真正连服务时才需要(merge/统计逻辑可无依赖单独测试)
+    from benchmark.mcp_client import MCPClient
+
     async def _run() -> list:
         client = MCPClient(url)
         tools = await client.list_tools()
@@ -48,23 +68,14 @@ def dump_one(url: str, domain: str, out_path: str) -> int:
         print(f"[FAIL] {domain}: {url} 未返回任何工具(服务未启动/端口不对?)")
         return 1
 
-    merged = {t["name"]: t for t in load_existing(out_path) if isinstance(t, dict) and t.get("name")}
-    for t in tools:
-        entry = {
-            "name": t.get("name"),
-            "description": t.get("description", ""),
-            "input_schema": t.get("inputSchema") or t.get("input_schema") or {},
-            "_domain": domain,
-        }
-        merged[entry["name"]] = entry
-
-    out = sorted(merged.values(), key=lambda x: (x.get("_domain", ""), x["name"]))
+    out = merge_tools(load_existing(out_path), tools, domain)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
     dom_count = sum(1 for t in out if t.get("_domain") == domain)
+    dup = len({t["name"] for t in out}) and len(out) - len({t["name"] for t in out})
     print(f"[OK] {domain}: 本次 dump {len(tools)} 个工具;文件现有 {len(out)} 个工具"
-          f"(本域累计 {dom_count}) -> {out_path}")
+          f"(本域累计 {dom_count},跨域重名 {dup} 个) -> {out_path}")
     return 0
 
 

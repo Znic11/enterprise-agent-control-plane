@@ -99,6 +99,8 @@ def main():
             print(f"真实工具池(按域分池): " +
                   ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
         else:
+            seen, real = set(), [t for t in real if not
+                                 (t["name"] in seen or seen.add(t["name"]))]
             pools = {d: real for d in {t["domain"] for t in tasks}}
         for d in {t["domain"] for t in tasks} - set(pools):
             pools[d] = real

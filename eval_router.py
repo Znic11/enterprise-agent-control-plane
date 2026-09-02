@@ -334,7 +334,16 @@ def main() -> None:
             print(f"使用真实工具池(按域分池): " +
                   ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
         else:
-            print(f"使用真实全量工具池: {len(real)} tools")
+            # 跨域重名工具:全量池按 name 去重(先出现者优先,与 executor 运行时一致),
+            # 避免 ToolRouter.by_name 索引相互覆盖
+            seen, dedup = set(), []
+            for t in real:
+                if t["name"] not in seen:
+                    seen.add(t["name"])
+                    dedup.append(t)
+            print(f"使用真实全量工具池: {len(real)} 条 -> 按 name 去重后 {len(dedup)} 个"
+                  f"(跨域重名 {len(real) - len(dedup)} 个,官方各域容器本就存在同名工具)")
+            real = dedup
             pools = {d: real for d in {t["domain"] for t in tasks}}
         missing = {t["domain"] for t in tasks} - set(pools)
         if missing:
