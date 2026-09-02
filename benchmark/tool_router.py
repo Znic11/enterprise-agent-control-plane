@@ -251,8 +251,9 @@ def route_keywords(
 ROUTER_PROMPT = """You are a tool router for an enterprise agent. Given a user task and a list of candidate tools, select the tools needed to complete the task.
 
 Rules:
-- Select tools you would actually call for this task, including read-only lookups.
-- When unsure, prefer INCLUDING a tool over missing it (a missing tool fails the task; an extra one only adds noise).
+- Select ALL tools you would actually call for this task, including read-only lookups (find/list/get/search/retrieve) needed to obtain IDs or entity details referenced in the task.
+- Enterprise tasks in this benchmark typically need 6-20 tools covering every sub-step (lookups, creates, updates, links). Do NOT over-truncate: a missing tool fails the task, an extra one only adds noise.
+- When unsure, prefer INCLUDING a tool over missing it.
 - Return ONLY a JSON array of tool names, no explanation, no markdown.
 
 Task:
@@ -366,6 +367,7 @@ class RouteResult:
     candidate_size: int = 0
     top_score: float = 0.0
     fallback: Optional[str] = None
+    candidate_names: List[str] = field(default_factory=list)  # ③ 粗筛候选(精排输入),归因用
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
@@ -374,6 +376,7 @@ class RouteResult:
             "router_selected": self.selected,
             "router_full_tool_count": self.full_tool_count,
             "router_candidate_size": self.candidate_size,
+            "router_candidate_names": self.candidate_names,
             "router_top_score": round(self.top_score, 4),
             "router_fallback": self.fallback,
         }
@@ -439,6 +442,7 @@ def route(
         task_text=task_text,
         candidate_size=meta.get("candidate_size", len(subset)),
         top_score=top_score,
+        candidate_names=meta.get("candidate_names", []),
     )
 
 
@@ -506,11 +510,13 @@ async def batch_route(
             subset = [router.by_name[n] for n in llm_names if n in router.by_name]
             return task_text, RouteResult(
                 selected=[t["name"] for t in subset], method="tfidf+llm",
-                candidate_size=meta.get("candidate_size", len(subset)), **common)
+                candidate_size=meta.get("candidate_size", len(subset)),
+                candidate_names=cand_names, **common)
 
         return task_text, RouteResult(  # LLM 失败/过少 → 回退粗筛子集
             selected=[t["name"] for t in subset], method="tfidf",
-            candidate_size=meta.get("candidate_size", len(subset)), **common)
+            candidate_size=meta.get("candidate_size", len(subset)),
+            candidate_names=cand_names, **common)
 
     pairs = await asyncio.gather(*(_one(t) for t in task_texts))
     return dict(pairs)

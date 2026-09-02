@@ -159,7 +159,8 @@ def _eval_one_variant(
             agg["exposed"] += len(pred)
 
     all_agg["macro"] = macro_sum / len(tasks) if tasks else 0.0
-    return {**{d: dict(a) for d, a in dom_agg.items()}, "ALL": all_agg}
+    agg = {**{d: dict(a) for d, a in dom_agg.items()}, "ALL": all_agg}
+    return agg, results_by_prompt
 
 
 def print_variant(name: str, agg: Dict[str, Dict[str, float]], top_k: int, verbose: bool) -> None:
@@ -188,12 +189,13 @@ def evaluate(
     """
     verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
     results = {}
+    by_prompt_all = {}
 
     # 变体 1:纯粗筛(纯 CPU,毫秒级/任务)
     print(f"\n{'#' * 66}\n# 变体: TF-IDF 粗筛\n{'#' * 66}")
     t0 = time.perf_counter()
-    results["TF-IDF 粗筛"] = _eval_one_variant(tasks, pools, top_k, llm_call_async=None,
-                                               verbose=verbose)
+    results["TF-IDF 粗筛"], by_prompt_all["TF-IDF 粗筛"] = _eval_one_variant(
+        tasks, pools, top_k, llm_call_async=None, verbose=verbose)
     print(f"(粗筛耗时 {time.perf_counter() - t0:.2f}s)")
 
     if llm_config_path is None:
@@ -209,11 +211,14 @@ def evaluate(
 
     print(f"\n{'#' * 66}\n# 变体: 粗筛 + LLM 精排(并发={concurrency})\n{'#' * 66}")
     t0 = time.perf_counter()
-    results["粗筛 + LLM 精排"] = _eval_one_variant(tasks, pools, top_k,
-                                                   llm_call_async=llm_call_async,
-                                                   concurrency=concurrency, verbose=verbose)
+    results["粗筛 + LLM 精排"], by_prompt_all["粗筛 + LLM 精排"] = _eval_one_variant(
+        tasks, pools, top_k, llm_call_async=llm_call_async,
+        concurrency=concurrency, verbose=verbose)
     elapsed = time.perf_counter() - t0
     print_variant("粗筛 + LLM 精排", results["粗筛 + LLM 精排"], top_k, verbose)
+
+    _print_miss_attribution(tasks, by_prompt_all["TF-IDF 粗筛"],
+                            by_prompt_all["粗筛 + LLM 精排"], verbose)
 
     if latencies:
         lat = sorted(latencies)
@@ -231,6 +236,48 @@ def evaluate(
     print(f"  precision@{top_k}: {a1['tp']/a1['n_pred']:.1%} -> {a2['tp']/a2['n_pred']:.1%} "
           f"({a2['tp']/a2['n_pred'] - a1['tp']/a1['n_pred']:+.1%})")
     _print_targets(top_k)
+
+
+def _print_miss_attribution(tasks, coarse_by_prompt, llm_by_prompt, verbose: bool) -> None:
+    """漏检归因:区分『粗筛没捞进来』和『粗筛捞了但被 LLM 精排砍掉』。
+
+    仅对 method=tfidf+llm 的任务可精确二分(其 candidate_names = 精排输入);
+    回退任务(超时/低选数)漏检全部记粗筛侧,并单独标注。
+    """
+    print(f"\n=== 漏检归因(粗筛漏选 vs LLM 精排砍掉)===")
+    tot_rerank, tot_coarse, n_fallback, n_rerank = 0, 0, 0, 0
+    for t in tasks:
+        oracle = t.get("reachable_tools", t["selected_tools"])
+        lres = llm_by_prompt[t["user_prompt"]]
+        if lres.method != "tfidf+llm":
+            n_fallback += 1
+            miss = oracle - set(lres.selected)
+            tot_coarse += len(miss)
+            if verbose and miss:
+                print(f"  {t['id'][:28]:<28} [回退,{lres.method}] 粗筛漏 {len(miss)}: {sorted(miss)}")
+            continue
+        n_rerank += 1
+        cand = set(getattr(lres, "candidate_names", []) or [])
+        rmiss = (oracle & cand) - set(lres.selected)   # 精排砍掉:进了候选但被 LLM 剔除
+        cmiss = oracle - cand                          # 粗筛漏选:连候选都没进
+        tot_rerank += len(rmiss)
+        tot_coarse += len(cmiss)
+        if verbose and (rmiss or cmiss):
+            parts = []
+            if cmiss:
+                parts.append(f"粗筛漏 {len(cmiss)}: {sorted(cmiss)}")
+            if rmiss:
+                parts.append(f"精排砍 {len(rmiss)}: {sorted(rmiss)}")
+            print(f"  {t['id'][:28]:<28} " + " | ".join(parts))
+    print(f"\n  合计: 粗筛漏选 {tot_coarse} 个 | 精排砍掉 {tot_rerank} 个"
+          f" | 回退任务 {n_fallback} 个(超时/低选数,未参与精排) | 精排生效 {n_rerank} 个")
+    if tot_rerank and tot_rerank > tot_coarse:
+        print("  → 漏检主要来自精排过度截断:可调高 ROUTER_PROMPT 工具数下限,"
+              "或精排结果与粗筛 top-k 取并集(召回优先融合)。")
+    elif tot_coarse and tot_coarse > tot_rerank:
+        print("  → 漏检主要来自粗筛:候选阶段就没捞到,调 top_k/LOOKUP_FLOOR 或查询扩展。")
+    elif tot_rerank and tot_coarse:
+        print("  → 粗筛与精排各贡献约一半漏检:两侧都需要调(粗筛扩容 + 精排防过度截断)。")
 
 
 def _print_targets(top_k: int) -> None:
