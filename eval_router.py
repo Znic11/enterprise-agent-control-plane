@@ -133,7 +133,7 @@ def _eval_one_variant(
     for t in tasks:
         result = results_by_prompt[t["user_prompt"]]
         pred = set(result.selected)
-        oracle = t["selected_tools"]
+        oracle = t.get("reachable_tools", t["selected_tools"])  # 可达 GT(池中真实存在)
         tp = len(pred & oracle)
         recall = tp / len(oracle) if oracle else 0.0
         precision = tp / len(pred) if pred else 0.0
@@ -141,7 +141,9 @@ def _eval_one_variant(
         macro_sum += recall
 
         if verbose:
-            print(f"{t['domain']:<8} {t['id'][:28]:<28} |{len(oracle):>3} |{len(pred):>3} | "
+            n_raw = len(t["selected_tools"])
+            gt_label = f"{len(oracle)}/{n_raw}" if len(oracle) != n_raw else str(n_raw)
+            print(f"{t['domain']:<8} {t['id'][:28]:<28} |{gt_label:>6} |{len(pred):>3} | "
                   f"recall={recall:>6.1%} precision={precision:>6.1%} "
                   f"full={'Y' if full else '-'} fb={result.fallback or '-'} "
                   f"method={result.method}")
@@ -249,12 +251,15 @@ def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, 
     t = tasks[0]
     result = route(t["user_prompt"], pools[t["domain"]], top_k=top_k)
     pred = set(result.selected)
-    miss = t["selected_tools"] - pred
+    unreach = t.get("unreachable", set())
+    miss = (t["selected_tools"] - pred) - unreach
     print("=== 样例路由核对 ===")
     print(f"任务: {t['user_prompt'][:140]}...")
     print(f"ground truth({len(t['selected_tools'])}): {sorted(t['selected_tools'])}")
+    if unreach:
+        print(f"⚠️ 其中 {len(unreach)} 个不在可用池中(跨域引用,路由器不可能选中): {sorted(unreach)}")
     print(f"预测({len(pred)}, method={result.method}): {sorted(pred)}")
-    print(f"漏检: {sorted(miss) if miss else '无'}")
+    print(f"漏检(可达口径): {sorted(miss) if miss else '无'}")
     print(f"meta: {result.to_metadata()}\n")
 
 
@@ -345,6 +350,18 @@ def main() -> None:
         print("使用近似域内池(pool_mode=domain): " +
               ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
     print(f"共 {len(tasks)} 任务, top_k={args.top_k}\n")
+
+    # 可达性核对:GT 工具必须存在于该任务的可用池,否则任何路由器都不可能选中。
+    # 本地数据已知问题:gym_servers_config 只挂单 server,但 GT 引用了其他域容器上的工具。
+    unreach_total = 0
+    for t in tasks:
+        pool_names = {x["name"] for x in pools[t["domain"]]}
+        t["unreachable"] = t["selected_tools"] - pool_names
+        t["reachable_tools"] = t["selected_tools"] & pool_names
+        unreach_total += len(t["unreachable"])
+    if unreach_total:
+        print(f"⚠️ {unreach_total} 个 GT 工具不在对应域池中(跨域引用,GT 在其他域的容器上):"
+              f"这些工具任何路由器都选不到,以下 recall/full_cov 按『可达 GT』口径计算\n")
 
     if args.llm_config:
         print(f"已启用 LLM 精排(router LLM: {args.llm_config}, 并发={args.concurrency}),"

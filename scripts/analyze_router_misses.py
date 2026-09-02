@@ -114,9 +114,14 @@ def main():
     k_candidate = max(30, args.top_k)
     total_miss, total_fp = Counter(), Counter()
     task_stats = []
+    n_unreach = 0
 
     for t in tasks:
         pool = pools[t["domain"]]
+        # 可达性核对:不在池中的 GT 任何路由器都选不到,不计入漏检分类
+        unreach = t["selected_tools"] - {x["name"] for x in pool}
+        n_unreach += len(unreach)
+        t = dict(t, selected_tools=t["selected_tools"] & {x["name"] for x in pool})
         router = ToolRouter(pool, k_candidate=k_candidate, k_final=args.top_k)
         mc, fc, md, fd = analyze_task(t, router, pool, args.top_k, k_candidate, noise_names)
         total_miss.update(mc)
@@ -130,7 +135,9 @@ def main():
     n_gt = sum(len(t["selected_tools"]) for t in tasks)
     n_slots = len(tasks) * args.top_k
     print(f"任务数 {len(tasks)} | top_k={args.top_k} | k_candidate={k_candidate} | "
-          f"GT 工具总数 {n_gt} | 子集槽位总数 {n_slots}")
+          f"GT 工具总数 {n_gt}(可达口径) | 子集槽位总数 {n_slots}")
+    if n_unreach:
+        print(f"⚠️ 另有 {n_unreach} 个 GT 工具不在对应域池中(跨域引用),已从漏检统计中剔除")
     print(f"micro recall = {1 - sum(total_miss.values())/n_gt:.1%} | "
           f"micro precision = {1 - sum(total_fp.values())/n_slots:.1%}\n")
 
