@@ -320,8 +320,22 @@ def main() -> None:
 
     if args.tools:
         real = load_real_tools(args.tools)
-        print(f"使用真实全量工具池: {len(real)} tools")
-        pools = {d: real for d in {t["domain"] for t in tasks}}
+        if args.pool_mode == "domain" and any("_domain" in t for t in real):
+            # dump 带来源域标记:按真实域分池(池大小=真实域内工具数,最贴生产口径)
+            pools = defaultdict(list)
+            for t in real:
+                pools[t.get("_domain")].append(t)
+            pools = dict(pools)
+            print(f"使用真实工具池(按域分池): " +
+                  ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
+        else:
+            print(f"使用真实全量工具池: {len(real)} tools")
+            pools = {d: real for d in {t["domain"] for t in tasks}}
+        missing = {t["domain"] for t in tasks} - set(pools)
+        if missing:
+            print(f"⚠️ dump 中缺少域 {sorted(missing)},这些域将使用全量池")
+            for d in missing:
+                pools[d] = real
     elif args.pool_mode == "cross":
         pool = build_cross_pool(tasks)
         print(f"使用近似跨域全池: {len(pool)} tools(pool_mode=cross)")
