@@ -40,7 +40,7 @@ def analyze_task(task, router: ToolRouter, pool, top_k: int, k_candidate: int, n
     boosted = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n) for s, n in raw]
     boosted.sort(reverse=True)
     rank_of = {n: i + 1 for i, (s, n) in enumerate(boosted)}
-    score_of = dict(boosted)
+    score_of = {n: s for s, n in boosted}  # 修复:dict((score,name)) 会把键值倒置
     pred = {n for _, n in boosted[:top_k]}
     oracle = task["selected_tools"]
 
@@ -90,7 +90,19 @@ def main():
     if args.tools:
         real = load_real_tools(args.tools)
         noise_names = set()
-        pools = {d: real for d in {t["domain"] for t in tasks}}
+        if args.pool_mode == "domain" and any("_domain" in t for t in real):
+            # 与 eval_router 同口径:dump 带 _domain 时按真实域分池
+            by_dom = defaultdict(list)
+            for t in real:
+                by_dom[t.get("_domain")].append(t)
+            pools = dict(by_dom)
+            print(f"真实工具池(按域分池): " +
+                  ", ".join(f"{d}={len(p)}" for d, p in sorted(pools.items())))
+        else:
+            pools = {d: real for d in {t["domain"] for t in tasks}}
+        for d in {t["domain"] for t in tasks} - set(pools):
+            pools[d] = real
+            print(f"⚠️ dump 缺少域 {d},使用全量池")
     else:
         pools = ({"d": build_cross_pool(tasks) for d in {t["domain"] for t in tasks}}
                  if args.pool_mode == "cross"
@@ -150,13 +162,13 @@ def main():
     fam = total_fp.get("family_overlap", 0)
     noise = total_fp.get("noise_tool", 0)
     if z:
-        print(f"1. zero_overlap={z}:任务说实体不说动词 → (a)真实 description 密集匹配(最重要,"
-              f"先 dump 工具池);(b)LLM 精排做语义补选;(c)查询扩展(实体→域概念)。")
+        print(f"1. zero_overlap={z}:任务只写实体不写工具动词/名词 → LLM 精排语义补选;"
+              f"查询扩展(实体→域概念)可再啃一部分。")
     if b:
-        print(f"2. below_cutoff={b}:排序不够好 → 调 LOOKUP_FLOOR/名称加权,或 top_k 上调"
-              f"(每 +1 槽位约 +{b and z and 0 or 0})用本脚本重测。")
+        print(f"2. below_cutoff={b}:rank 在 {args.top_k + 1}-{k_candidate} 之间,"
+              f"差几名没进子集 → top_k 上调或提高 LOOKUP_FLOOR 后用本脚本重测。")
     if o:
-        print(f"3. outside_candidates={o}:被同池工具碾压 → 检查分母 IDF 与签名质量。")
+        print(f"3. outside_candidates={o}:有分但被同族工具挤出候选 → 精排/名称加权。")
     if fam:
         print(f"4. family_overlap={fam}:同族近义占位 → LLM 精排可剔除(纯粗筛无法区分"
               f" add/update/delete 同实体动作),这是精排的核心价值点。")
