@@ -43,7 +43,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from benchmark.tool_router import batch_route, route
+from benchmark.tool_router import ToolRouter, batch_route, route
 
 # server 名 → dump _domain 的映射(任务 gym_servers_config 里写的是挂载哪些
 # MCP server;这是执行器运行时本来就有的配置,不是答案泄露)。本地样例:
@@ -397,6 +397,234 @@ def _print_agg_row(label: str, a: Dict[str, float], top_k: int) -> None:
     print(f"{label:<8}{int(a['n']):>4}{recall:>9.1f}%{precision:>12.1f}%{full:>9.1f}%{exposed:>9.1f}{int(a['fb']):>10}")
 
 
+# ---------------------------------------------------------------------------
+# Meta-Tool 离线指标(诊断检索器在"分批能力片段" query 下的覆盖;诚实口径见下)
+# ---------------------------------------------------------------------------
+
+# MetaToolOrchestrator.get_result_metadata() 输出的 run 级指标键(日志聚合用)
+META_TOOL_METRIC_KEYS = (
+    "meta_tool_search_calls",
+    "meta_tool_searches",
+    "meta_tool_cache_hits",
+    "meta_tool_zero_hits",
+    "meta_tool_fallback_all",
+    "meta_tool_hits_avg",
+)
+
+
+def _segment_queries(user_prompt: str, max_queries: int) -> List[str]:
+    """启发式:把任务文本切成候选检索 query(句/段),模拟执行期模型分轮
+    表达能力需求时 query 的词法形态。
+
+    ⚠️ 这不是 LLM 自生成 query —— 只用于评估检索器对"功能片段"这类 query
+    的覆盖,是端到端指标的下界/诊断,不能替代真实端到端实验。
+    """
+    import re
+
+    parts = [
+        p.strip()
+        for p in re.split(r"[.;!?\n]+", user_prompt or "")
+        if p and len(p.strip()) >= 12
+    ]
+    if not parts:
+        # 兜底:整段前 200 字符作为单条 query
+        return [user_prompt[:200]] if user_prompt else []
+    return [p[:200] for p in parts[:max_queries]]
+
+
+def simulate_meta_tool(
+    tasks: List[Dict[str, Any]],
+    pools: Dict[str, List[Dict[str, Any]]],
+    search_top_k: int = 6,
+    min_score: float = 0.03,
+    max_searches: int = 4,
+    verbose: bool = True,
+):
+    """Meta-Tool 离线仿真:模拟执行期逐轮 ``_tool_search(query)`` 的检索形态。
+
+    query 来自任务文本自动切段(启发式,见 _segment_queries);每轮检索的 top-k
+    命中并入"可用集"(对应 orchestrator 的 bind 注入),统计:
+
+      final_recall     可用集对 reachable GT 的最终覆盖率(多轮累计)
+      first_recall     第一轮检索即覆盖的比例(单轮能捞到多少)
+      hits_avg         平均每轮检索命中 GT 工具数(对应 meta_tool_hits_avg)
+      zero_rate        零命中轮次占比
+      final_precision  可用集里真正是 GT 的比例
+
+    返回 (聚合 {domain:…, ALL:…}, 每任务明细)。诚实口径:仿真 query 非 LLM
+    生成,数字只用于诊断检索器与参数(端到端增益需服务端 evaluate.py
+    --orchestrator meta_tool)。
+    """
+    routers: Dict[str, ToolRouter] = {}
+    pool_names: Dict[str, set] = {}
+    per_task: List[Dict[str, Any]] = []
+
+    def _router(key: str) -> Tuple[ToolRouter, set]:
+        if key not in routers:
+            pool = pools.get(key) or next(iter(pools.values()), [])
+            routers[key] = ToolRouter(pool)
+            pool_names[key] = {x["name"] for x in pool}
+        return routers[key], pool_names[key]
+
+    for t in tasks:
+        key = t.get("pool_key") or t["domain"]
+        router, names = _router(key)
+        oracle = t.get("reachable_tools", t["selected_tools"])
+        queries = _segment_queries(t["user_prompt"], max_searches)
+
+        avail: set = set()
+        gt_hits_per_search: List[int] = []
+        zero = 0
+        for q in queries:
+            raw = router.search(
+                q, top_k=search_top_k, min_score=min_score, boost_lookup=False
+            )
+            found = {n for _s, n in raw if n in names}
+            gt_hits_per_search.append(len(found & oracle))
+            if not found:
+                zero += 1
+            avail |= found
+        searches_done = len(gt_hits_per_search) or 1
+        tp = len(avail & oracle)
+        per_task.append(
+            {
+                "id": t["id"],
+                "domain": t["domain"],
+                "oracle_size": len(oracle),
+                "avail_size": len(avail),
+                "recall": tp / len(oracle) if oracle else 0.0,
+                "first_tp": gt_hits_per_search[0] if gt_hits_per_search else 0,
+                "first_recall": (
+                    (gt_hits_per_search[0] / len(oracle)) if oracle and gt_hits_per_search else 0.0
+                ),
+                "hits_avg": sum(gt_hits_per_search) / searches_done,
+                "zero": zero,
+                "searches": len(gt_hits_per_search),
+                "tp": tp,
+                "precision": tp / len(avail) if avail else 0.0,
+                "full": 1 if oracle and avail and oracle <= avail else 0,
+            }
+        )
+
+    agg: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"n": 0, "tp": 0, "gt": 0, "fp": 0, "avail": 0,
+                 "first_tp": 0, "hits": 0, "zero": 0, "full": 0, "searches": 0}
+    )
+    all_agg = agg["ALL"]
+    for p in per_task:
+        for a in (agg[p["domain"]], all_agg):
+            a["n"] += 1
+            a["tp"] += p["tp"]
+            a["gt"] += p["oracle_size"]
+            a["first_tp"] += p["first_tp"]
+            a["avail"] += p["avail_size"]
+            a["hits"] += p["hits_avg"] * p["searches"]
+            a["zero"] += p["zero"]
+            a["full"] += p["full"]
+            a["searches"] += p["searches"]
+
+    if verbose:
+        print(f"\n=== Meta-Tool 离线仿真(top_k={search_top_k}, min_score={min_score}, "
+              f"≤{max_searches} 轮检索)===")
+        print("> ⚠️ query 由任务文本自动切段模拟(非 LLM 生成):数字 = 检索器对"
+              "『分批能力片段』query 的覆盖下界/诊断,")
+        print(">   端到端增益需服务端跑 evaluate.py --orchestrator meta_tool。")
+        print(f"{'domain':<8}  {'n':>3}  {'final_recall':>12}  {'first_recall':>12}  "
+              f"{'hits_avg':>8}  {'zero%':>7}  {'full_cov':>8}  {'precision':>9}")
+        print("-" * 78)
+        for dom in sorted(a for a in agg if a != "ALL"):
+            _print_meta_sim_row(dom, agg[dom])
+        _print_meta_sim_row("ALL", all_agg)
+    return dict(agg), per_task
+
+
+def _print_meta_sim_row(label: str, a: Dict[str, Any]) -> None:
+    recall = a["tp"] / a["gt"] * 100 if a["gt"] else 0
+    first = a["first_tp"] / a["gt"] * 100 if a["gt"] else 0
+    hits_avg = a["hits"] / a["searches"] if a["searches"] else 0
+    zero = a["zero"] / a["searches"] * 100 if a["searches"] else 0
+    full = a["full"] / a["n"] * 100 if a["n"] else 0
+    prec = a["tp"] / a["avail"] * 100 if a["avail"] else 0
+    print(f"{label:<8}  {int(a['n']):>3}  {recall:>11.1f}%  {first:>11.1f}%  "
+          f"{hits_avg:>8.2f}  {zero:>6.1f}%  {full:>7.1f}%  {prec:>8.1f}%")
+
+
+def analyze_meta_tool_runs(
+    results_dir: str, tasks: Optional[List[Dict[str, Any]]] = None
+) -> None:
+    """聚合 evaluate.py --orchestrator meta_tool 结果 JSON 里的 run 级 meta_tool_*
+    元数据,输出执行期真实指标(meta_tool_searches / cache_hits / hits_avg ...)。
+
+    可选传入 tasks(load_tasks 结果)时,额外按 benchmark_config.user_prompt
+    匹配任务 GT,计算 final_recall = |注入集 ∩ reachable GT| / |GT|(注入集 =
+    meta_tool_injected;兜底全池的 run 单独标注,该口径会虚高)。⚠️ selected_tools
+    仅在此离线聚合中作为 GT,运行期 orchestrator 从未读取它。
+    """
+    files = sorted(glob.glob(os.path.join(results_dir, "results_*.json")))
+    if not files:
+        print(f"⚠️ 未在 {results_dir} 找到 results_*.json")
+        return
+    by_prompt = {t["user_prompt"]: t for t in (tasks or [])}
+    rows = []
+    for fp in files:
+        with open(fp, encoding="utf-8") as f:
+            data = json.load(f)
+        for run in data.get("runs", []):
+            if not any(k in run for k in META_TOOL_METRIC_KEYS):
+                continue
+            row: Dict[str, Any] = {
+                "file": os.path.basename(fp),
+                "run_number": run.get("run_number"),
+                "success": run.get("overall_success"),
+            }
+            for k in META_TOOL_METRIC_KEYS:
+                row[k] = run.get(k, 0)
+            row["meta_tool_injected"] = run.get("meta_tool_injected", [])
+            # 可选 final_recall:注入集(可用集)对可达 GT 的覆盖
+            if by_prompt:
+                t = by_prompt.get(data.get("benchmark_config", {}).get("user_prompt"))
+                if t is not None:
+                    oracle = t.get("reachable_tools", t["selected_tools"])
+                    injected = set(run.get("meta_tool_injected", []))
+                    row["final_recall"] = (
+                        len(injected & oracle) / len(oracle) if oracle else 0.0
+                    )
+                    row["oracle_size"] = len(oracle)
+            rows.append(row)
+    if not rows:
+        print("⚠️ 日志中未发现 meta_tool_* 元数据(确认运行用了 --orchestrator meta_tool)")
+        return
+
+    n = len(rows)
+    s = lambda k: sum(r.get(k, 0) for r in rows)  # noqa: E731
+    ok = sum(1 for r in rows if r.get("success"))
+    print(f"\n=== Meta-Tool 运行日志聚合({n} runs, 成功 {ok})===")
+    print(f"  meta_tool_search_calls(模型发起的 _tool_search): {s('meta_tool_search_calls')}")
+    print(f"  meta_tool_searches(实际检索,缓存未命中):        {s('meta_tool_searches')}")
+    print(f"  meta_tool_cache_hits(query->tools 缓存命中):    {s('meta_tool_cache_hits')}")
+    print(f"  meta_tool_zero_hits(零命中轮):                  {s('meta_tool_zero_hits')}")
+    hit_vals = [r["meta_tool_hits_avg"] for r in rows if r.get("meta_tool_hits_avg")]
+    if hit_vals:
+        print(f"  meta_tool_hits_avg 均值(每检索命中工具数):     {sum(hit_vals) / len(hit_vals):.2f}")
+    fb = [r for r in rows if r.get("meta_tool_fallback_all")]
+    print(f"  触发全池兜底(fallback_all)的 run:               {len(fb)}")
+    fr = [r for r in rows if "final_recall" in r]
+    if fr:
+        print(f"  final_recall(注入集覆盖可达 GT,均值):           "
+              f"{sum(r['final_recall'] for r in fr) / len(fr):.1%} "
+              f"({len(fr)} runs;兜底 run 会虚高,见上方标注)")
+    print(f"\n{'file':<34}{'run':>4}{'ok':>4}{'calls':>7}{'searches':>9}"
+          f"{'cache':>7}{'zero':>6}{'fallback':>9}")
+    for r in rows[:50]:
+        print(f"{r['file'][:34]:<34}{int(r['run_number'] or 0):>4}"
+              f"{'Y' if r.get('success') else '-':>4}"
+              f"{int(r.get('meta_tool_search_calls', 0)):>7}"
+              f"{int(r.get('meta_tool_searches', 0)):>9}"
+              f"{int(r.get('meta_tool_cache_hits', 0)):>7}"
+              f"{int(r.get('meta_tool_zero_hits', 0)):>6}"
+              f"{'Y' if r.get('meta_tool_fallback_all') else '-':>9}")
+
+
 def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
     """打印第一个任务的路由明细,便于人工核对漏检。"""
     t = tasks[0]
@@ -482,6 +710,21 @@ def main() -> None:
                          "union 模式下必须 > top_k 才有意义:如 --top_k 30 --candidate_k 60,"
                          "粗筛保底 30、LLM 从 60 候选内增补 30-60 区间的必需工具,"
                          "噪声从 60 压到 ~30-45 且召回不掉;候选=输出时 union ≡ 纯粗筛(白付延迟)")
+    # ---- Meta-Tool 离线指标(仿真 + 运行日志聚合)----
+    ap.add_argument("--meta_sim", action="store_true",
+                    help="跑 Meta-Tool 离线仿真:任务文本切段模拟逐轮 _tool_search,"
+                         "统计 final_recall/first_recall/hits_avg/zero_pct(诊断检索器覆盖;"
+                         "query 非 LLM 生成,非端到端口径)")
+    ap.add_argument("--meta_sim_top_k", type=int, default=6,
+                    help="仿真中每次检索返回工具数(默认 6,与 orchestrator 默认一致)")
+    ap.add_argument("--meta_sim_min_score", type=float, default=0.03,
+                    help="仿真中检索分数下限(低于记零命中;默认 0.03)")
+    ap.add_argument("--meta_sim_max_searches", type=int, default=4,
+                    help="仿真中最多模拟几轮检索(默认 4)")
+    ap.add_argument("--analyze_meta_runs", default=None,
+                    help="聚合 evaluate.py --orchestrator meta_tool 的结果目录 "
+                         "(results_*.json 的 run 级 meta_tool_* 元数据);可选传入 "
+                         "--data_dir 任务以计算 final_recall(GT 仅离线用)")
     args = ap.parse_args()
 
     tasks = load_tasks(args.data_dir)
@@ -600,6 +843,17 @@ def main() -> None:
     evaluate(tasks, pools, args.top_k,
              llm_config_path=args.llm_config, concurrency=args.concurrency,
              rerank_mode=args.rerank_mode, candidate_k=args.candidate_k)
+
+    # Meta-Tool 离线指标:仿真(本地可跑)+ 运行日志聚合(服务端 evaluate 产物)
+    if args.meta_sim:
+        simulate_meta_tool(
+            tasks, pools,
+            search_top_k=args.meta_sim_top_k,
+            min_score=args.meta_sim_min_score,
+            max_searches=args.meta_sim_max_searches,
+        )
+    if args.analyze_meta_runs:
+        analyze_meta_tool_runs(args.analyze_meta_runs, tasks=tasks)
 
 
 if __name__ == "__main__":

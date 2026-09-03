@@ -37,12 +37,14 @@ from orchestrators.react import ReactOrchestrator
 from orchestrators.planner_react import PlannerReactOrchestrator
 from orchestrators.decomposing_planner import DecomposingPlannerOrchestrator
 from orchestrators.react_router import ReactRouterOrchestrator
+from orchestrators.meta_tool_router import MetaToolOrchestrator
 
 ORCHESTRATOR_MAP = {
     "react": ReactOrchestrator,
     "planner_react": PlannerReactOrchestrator,
     "decomposing": DecomposingPlannerOrchestrator,
     "react_router": ReactRouterOrchestrator,
+    "meta_tool": MetaToolOrchestrator,
 }
 
 # Set up logging
@@ -192,6 +194,7 @@ async def execute_sample(
     config_file, llm_config, output_folder,
     orchestrator="react", planner_llm_config=None, max_num_attempts=5,
     router_top_k=20, router_llm_config=None,
+    meta_tool_top_k=6, meta_tool_min_score=0.03, meta_warmup_top_k=None,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -218,6 +221,11 @@ async def execute_sample(
             orchestrator_kwargs["router_llm_config"] = random.choice(
                 load_llm_configs(router_llm_config)
             )
+    if orchestrator == "meta_tool":
+        orchestrator_kwargs["tool_search_top_k"] = meta_tool_top_k
+        orchestrator_kwargs["tool_search_min_score"] = meta_tool_min_score
+        if meta_warmup_top_k is not None:
+            orchestrator_kwargs["warmup_top_k"] = meta_warmup_top_k
 
     executor = BenchmarkExecutor(
         config,
@@ -273,7 +281,7 @@ async def main():
         "--orchestrator",
         type=str,
         default="react",
-        choices=["react", "planner_react", "decomposing", "react_router"],
+        choices=["react", "planner_react", "decomposing", "react_router", "meta_tool"],
         help="Orchestration strategy.",
     )
     parser.add_argument(
@@ -294,6 +302,27 @@ async def main():
         default=None,
         help="Path to LLM config for the tool router (react_router only; "
              "defaults to free keyword routing when omitted).",
+    )
+    parser.add_argument(
+        "--meta_tool_top_k",
+        type=int,
+        default=6,
+        help="Tools retrieved per _tool_search call (meta_tool only).",
+    )
+    parser.add_argument(
+        "--meta_tool_min_score",
+        type=float,
+        default=0.03,
+        help="TF-IDF floor for _tool_search hits; below counts as zero-hit "
+             "(meta_tool only).",
+    )
+    parser.add_argument(
+        "--meta_warmup_top_k",
+        type=int,
+        default=None,
+        help="Hybrid warm-up: also inject route(user_prompt) top-k tools on the "
+             "first turn alongside _tool_search. Omit/None = pure Meta-Tool "
+             "single channel (meta_tool only).",
     )
     args = parser.parse_args()
 
@@ -347,6 +376,9 @@ async def main():
                 planner_llm_config=args.planner_llm_config,
                 router_top_k=args.router_top_k,
                 router_llm_config=args.router_llm_config,
+                meta_tool_top_k=args.meta_tool_top_k,
+                meta_tool_min_score=args.meta_tool_min_score,
+                meta_warmup_top_k=args.meta_warmup_top_k,
             ),
             concurrency=int(args.concurrency),
         )

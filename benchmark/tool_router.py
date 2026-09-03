@@ -111,7 +111,10 @@ def build_tool_signature(tool: Dict[str, Any]) -> str:
     name = tool["name"]
     desc = (tool.get("description") or "").split(".")[:2]
     desc = ". ".join(desc)[:200]
-    params = list((tool.get("input_schema") or {}).get("properties", {}).keys())
+    # 兼容两种 schema 字段名:MCP tools/list 原样是 inputSchema(驼峰),
+    # dump/评估/测试用 input_schema(小写)。小写优先、驼峰 fallback,不改变既有行为。
+    schema = tool.get("input_schema") or tool.get("inputSchema") or {}
+    params = list(schema.get("properties", {}).keys())
     return f"{name} {name} | {desc} | params: {', '.join(params[:12])}"
 
 
