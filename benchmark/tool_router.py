@@ -214,6 +214,53 @@ class ToolRouter:
             "bottom_score": out[-1][0] if out else 0.0,
         }
 
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        min_score: float = 0.0,
+        boost_lookup: bool = False,
+    ) -> List[Tuple[float, str]]:
+        """意图级检索:给定一段"能力需求"文本,返回全池最相关的 (score, name)。
+
+        与 route() 的区别:
+          * route() 面向"整条任务"做粗筛+可选精排,走完整三级漏斗;
+          * search() 面向"执行期单步缺口"(模型想干某事但不会/不能点名工具),
+            只做 TF-IDF 打分返回 top-k,不做截断/回退/精排 —— 由调用方决定
+            如何把命中并入活跃集(react_router 的意图级发现)。
+        - ``boost_lookup=True`` 时对 find_/list_/get_ 前缀加 LOOKUP_FLOOR 地板分,
+          与 route() 的只读启发式一致(供"模型只会描述动作不会说动词"场景)。
+        - 复用 __init__ 建好的索引,零额外构建开销;纯 CPU 毫秒级。
+        """
+        if not query or not query.strip():
+            return []
+        raw = self.index.search(query, top_k=top_k)
+        if boost_lookup:
+            raw = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n)
+                   for s, n in raw]
+            raw.sort(reverse=True)
+        return [(round(s, 4), n) for s, n in raw if s >= min_score]
+
+
+def search_tools(
+    query: str,
+    all_tools: List[Dict[str, Any]],
+    top_k: int = 10,
+    min_score: float = 0.0,
+    boost_lookup: bool = False,
+) -> List[Tuple[float, str]]:
+    """便捷函数:给定能力需求文本与全工具池,返回最相关的 (score, name)。
+
+    每次调用重建一次 TF-IDF 索引(512 工具量级毫秒级)。执行期高频触发请直接
+    持有 ``ToolRouter`` 实例并调用 ``.search()``(见 ToolRouter.search 文档)。
+    """
+    if not all_tools or not query or not query.strip():
+        return []
+    router = ToolRouter(all_tools)
+    return router.search(
+        query, top_k=top_k, min_score=min_score, boost_lookup=boost_lookup
+    )
+
 
 def expand_tool(tool_name: str, full_pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """④ 渐进式扩展:执行中请求子集外工具时,从全量池取 schema。"""
