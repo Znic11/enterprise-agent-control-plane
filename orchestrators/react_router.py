@@ -208,15 +208,23 @@ class ReactRouterOrchestrator(AgentOrchestrator):
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
+                tool_call_id = tool_call.get("id", "")
 
-                exec_result = await self._execute_tool_call(tool_name, tool_args)
-                tool_result = exec_result["result"]
-                target_gym = exec_result["gym_server"]
+                try:
+                    exec_result = await self._execute_tool_call(tool_name, tool_args)
+                    tool_result = exec_result["result"]
+                    target_gym = exec_result["gym_server"]
+                    logger.info(f"Tool result success: {tool_result.get('success')}")
+                    if tool_name not in tools_used:
+                        tools_used.append(tool_name)
+                except Exception as e:  # noqa: BLE001 — 工具执行失败回喂,不冒泡中断整轮 run
+                    logger.error(f"Tool '{tool_name}' execution failed: {e}")
+                    tool_result = {
+                        "success": False,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                    target_gym = None
 
-                logger.info(f"Tool result success: {tool_result.get('success')}")
-
-                if tool_name not in tools_used:
-                    tools_used.append(tool_name)
                 tool_results.append(
                     {
                         "tool_name": tool_name,
@@ -226,10 +234,15 @@ class ReactRouterOrchestrator(AgentOrchestrator):
                     }
                 )
 
+                content = (
+                    tool_result.get("result", {})
+                    if tool_result.get("success", False)
+                    else tool_result
+                )
                 messages.append(
                     ToolMessage(
-                        content=json.dumps(tool_result.get("result", {})),
-                        tool_call_id=tool_call.get("id", ""),
+                        content=json.dumps(content),
+                        tool_call_id=tool_call_id,
                     )
                 )
                 conversation_flow.append(

@@ -49,9 +49,10 @@ class AgentOrchestrator(ABC):
         target_gym = self.tool_to_server_mapping.get(tool_name)
 
         if not target_gym:
-            target_gym = list(self.mcp_clients.keys())[0]
-            logger.error(f"Tool '{tool_name}' not in mapping, using: {target_gym}")
-            raise
+            logger.error(f"Tool '{tool_name}' not in any gym's tool mapping")
+            raise ValueError(
+                f"Tool '{tool_name}' not found in available tool pool"
+            ) from None
 
         client = self.mcp_clients[target_gym]
         logger.info(f"Executing '{tool_name}' on '{target_gym}'")
