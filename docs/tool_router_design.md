@@ -265,3 +265,68 @@ import json, glob
 
 > 一个务实的提醒:先做 **M1 + M2 的 BM25 版**(零成本闭环),确认"工具治理"真的提分或省钱,
 > 再上 LLM 精排。不要一开始就堆复杂度 —— 这也是简历上"渐进式工程方法"的体现。
+
+---
+
+## 7. 执行期补充:意图级检索 + Meta-Tool(元工具)模式(2026-09-03 落地)
+
+> ⚠️ 本章补充 Phase-1 之后新增的两层执行期机制。正文 §3/§4 的 BM25 骨架是早期设计稿;
+> **当前唯一实现**是 `benchmark/tool_router.py`(TF-IDF 余弦 + `LOOKUP_FLOOR` 只读启发式,
+> 接口/语义以此为准)。落地详情与 9 个设计问题的定调见 `docs/HANDOFF.md` §4.5。
+
+### 7.1 第一层:执行期意图级检索(react_router 触发点 A/B/C,已提交 9a04a3d/2c2b62f)
+
+路由"事前给子集"只能覆盖粗筛已召回的 15–20 个工具。执行中模型会遇到三缺口,由
+`orchestrators/react_router.py` 处理(**命中工具只进可见集,绝不自动执行**):
+
+| 触发点 | 场景 | 行为 |
+|---|---|---|
+| A unknown_call | 模型点名全池不存在的工具(拼错/幻觉名) | `query = 名字\|参数键\|本轮文本` → 全池检索 → 并入活跃集 → 回喂 `{success:False, available_tools_added}` |
+| B exec_error | 真实工具执行抛异常 | try/except → 错误回喂 ToolMessage,不再中断整轮 run |
+| C text_gap | 无 tool_call 但文本命中 `_GAP_SIGNALS`("no such tool"…) | 检索 → 注入 `[system]` 新工具可用提示 → 再给一轮 |
+
+支撑 API:`ToolRouter.search(query, top_k, min_score, boost_lookup)`(复用 `__init__` 索引,零额外构建;
+只打分返回 `(score, name)`,入不入活跃集由调用方决定)。安全边界:检索输入只来自模型上下文与调用,
+**绝不读 selected_tools**(执行时读 = 答案泄露)。
+
+### 7.2 第二层:Meta-Tool(元工具)模式(本会话落地,未提交)
+
+参考 Spring AI Alibaba / OpenAI tool search / Anthropic tool search:**系统只暴露一个只读元工具
+`_tool_search`,由 LLM 显式决定"何时检索、搜什么"**,检索命中后把真实工具 schema 动态注入后续
+轮次的 bind 集。与 §7.1 的"系统事后兜底"相反,这是"事前内置为合法调用"——严格 function-calling
+下模型永远能合法调用 `_tool_search`(它在 bind 集内),天然不受"模型发不出子集外名字"的限制。
+
+```
+第 n 轮 bind 集 = [_tool_search] + 已注入真实工具 defs      (每轮 invoke 重新 bind,对 LLMClient 零改动)
+   │
+   ├─ LLM 调用 _tool_search(query, top_k?)
+   │     → orchestrator 拦截(只读,不执行任何真实工具)
+   │     → ToolRouter.search(query)   [复用 §3 唯一检索实现]
+   │     → 命中工具 _admit() 入注入集(保序去重)+ 回喂 found 清单
+   │     → 首注时追加 [system] "now bound and callable: …"(插在全部 ToolMessage 后)
+   ▼
+第 n+1 轮 bind 集 = [_tool_search] + 注入集   → 模型看到 schema 后显式调用真实工具
+   → 真实调用走 base._execute_tool_call → gym MCP;异常 try/except 回喂(单次失败不炸 run)
+```
+
+关键机制与默认值(实现:`orchestrators/meta_tool_router.py::MetaToolOrchestrator`):
+
+| 机制 | 默认 | 说明 |
+|---|---|---|
+| `tool_search_top_k` | 6 | 每次 `_tool_search` 返回工具数 |
+| `tool_search_min_score` | 0.03 | TF-IDF 分数下限,低于视为零命中 |
+| `cache_size` | 64 | 同会话 query→hits LRU 缓存(不跨任务,防重复检索) |
+| `fallback_all_after_zero_hits` | 3 | 连续零命中达阈值 → 兜底 bind 全池防死锁;`None`=关闭(只回喂引导) |
+| `warmup_top_k` | None | 预热模式:非 None 时 `__init__` 即注入 `route(user_prompt)` top-k(与元工具并存);None = 纯 Meta-Tool 单通道 |
+| `boost_lookup` | False | 检索是否对 find_/list_/get_ 前缀加只读地板分(对齐 route() 启发式) |
+
+**诚实性边界(硬性)**:`_tool_search` 只读——拦截后仅打分/返回/注入可见集,写副作用必须由模型
+后续显式调用真实工具触发;检索输入仅本轮 LLM 调用参数;`selected_tools` 仅用于离线评估与
+`eval_router.py --analyze_meta_runs` 聚合时的 GT 匹配。
+
+**评估**:离线仿真 `eval_router.py --meta_sim`(任务文本切段模拟逐轮检索,统计 final_recall /
+first_recall / hits_avg / zero% / full_cov / precision;诚实口径 = 检索器对"分批能力片段"query 的
+覆盖下界,非端到端);端到端 `evaluate.py --orchestrator meta_tool --meta_tool_top_k …`(服务端,
+run 级 `meta_tool_*` 元数据落盘 → `--analyze_meta_runs` 聚合)。对照口径:react_router vs
+meta_tool_router **同模型/同 split/同 concurrency**。
+

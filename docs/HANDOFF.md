@@ -9,8 +9,8 @@
 ## ⚡ 0. 三句话摘要(先读这里)
 
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研"企业级 LLM Agent",核心卖点 = 用 TF-IDF+LLM 的工具路由逼近 oracle 模式(把"答案泄露"变成"能力预测"),以可复现实验证明有效性,作为面试核心项目;代码同步沉淀在 GitHub 作品集 `enterprise-agent-control-plane`(= 本仓库 origin)。
-2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py` 三级漏斗 + `react_router.py` + 离线评估)已落地,并在**真实工具池**(tools_dump.json,458 工具/7 域,真实 description)上跑出指标与归因;最近两个会话新增**执行期鲁棒性修复 + 意图级检索(触发点 A/B/C)**,40/40 单测通过,**代码尚未提交**(见 §3.1)。
-3. **下一步(用户已选定新方向 → 元工具模式)**:① 决定未提交 diff 去留/提交;② **采用 Spring AI Alibaba 的"元工具 (Meta-Tool)"模式重做工具调用**——只暴露一个 `ToolSearchTool` 给 LLM,检索命中后动态注入业务工具 schema,自然兼容严格 function-calling(也自然解决原 §5.1 的 bind_tools 限制问题);③ 端到端价值验证仍空白(本地无 LLM key/容器,设计见 §4.5)。
+2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py` 三级漏斗 + `react_router.py` + 离线评估)已在真实工具池(tools_dump.json,512→458 工具/7 域)上跑出指标与归因;随后三个会话落地**执行期鲁棒性修复(B 异常不炸 run)+ 意图级检索(触发点 A/B/C)+ 元工具(Meta-Tool)模式**,单测 **51/51 通过**(§2),提交状态见 §3.3/§4。
+3. **当前状态(Meta-Tool 已实现;端到端价值验证是最大空白)**:`orchestrators/meta_tool_router.py::MetaToolOrchestrator` 已按 Spring AI Alibaba 思路落地——首轮只 bind `_tool_search`,LLM 显式调用 → 拦截 → `ToolRouter.search()`(TF-IDF)→ 命中工具 schema 动态并入后续轮次 bind 集 → 模型显式调用真实工具走 `_execute_tool_call`;`evaluate.py` 已注册、`eval_router.py` 已加离线仿真指标并跑出数字(§4.5.5)。**待办**:服务端端到端对照、提交本次 Meta-Tool diff、README 回填(§6)。
 
 ---
 
@@ -30,9 +30,9 @@
 | 事项 | 事实 |
 |---|---|
 | **真实 Python 环境** | 项目 `.venv`(Python 3.14.3,含 langchain_core 等全部依赖)。⚠️ 受管 python 3.13 与系统 anaconda **均无 langchain_core**;凡 import orchestrators / benchmark.llm_client 的代码只能用 `.\.venv\Scripts\python.exe` |
-| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **40 passed**(test_tool_router 33 + test_react_router 7);路由模块本身纯 stdlib,任意 py3 可跑 |
+| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **51 passed**(test_tool_router 33 + test_react_router 7 + test_meta_tool_router 11);路由模块本身纯 stdlib,任意 py3 可跑 |
 | **LLM key / 容器** | 本地 `conf/llm/` 不存在 → 端到端被 key 阻塞;容器/udocker 全套指令见 `RUN_GUIDE.md`(服务端已验证;本地 docker daemon 曾静默失败) |
-| **真实工具池** | `tools_dump.json`(仓库根,512 原始条目含 `_domain`,按 (name,_domain) 去重后 458),当前 **untracked**——建议 commit 或加 .gitignore |
+| **真实工具池** | `tools_dump.json`(仓库根,512 原始条目含 `_domain`,按 (name,_domain) 去重后 458)**已入库**(2c2b62f);⚠️ MCP `tools/list` 真实 schema 字段是 `inputSchema`(驼峰),dump/测试用 `input_schema`(小写)——`build_tool_signature` 已双兼容 |
 | **F 盘 git 陷阱** | 沙箱 `git rm` 会连带删除同目录其他工作树文件(多次踩坑)。规避:普通 `rm` + `git add -A`,或 `git checkout <branch> -- <file>` 取回;批量操作后必须 `ls` 核对 |
 | **git 拓扑** | `origin` = GitHub `Znic11/enterprise-agent-control-plane`(作品集,ssh.github.com:443);本地分支 `main`(当前)/ `remote`(服务端适配快照 8de4053)/ `local-tests`;origin 另有 main、remote。身份 znic |
 | **用户偏好** | 中文沟通、结构化表格摘要;**选择性 commit**:只提交功能有效变更,无关改动不混入;沙箱内可 py_compile/单测,重构建/容器验证由用户在自己环境做;README 对实现状态如实标注(防面试深挖翻车) |
@@ -55,21 +55,23 @@
 - full_cov 坑:32/160 GT 引用其他域容器工具(不可达),须按 reachable 口径排除(999c15d),否则 full_cov=0 误报。
 
 ### 3.3 相关 commit 链(main,新→旧)
-`6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底)← `7323b1c`(rerank_mode=union,recall ≥ 粗筛)← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断)← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导)← `0690b43`(dump 合并键 name,_domain)← `999c15d`(reachable-GT 口径)← `74e7207`(归因脚本修复)← `0d31b51/2d258f2`(dump/归因脚本)← `eee7bc5`(batch_route 并发)。
+`(待提交: Meta-Tool 落地 diff = tool_router.py +5 / evaluate.py +34 / eval_router.py +256 / meta_tool_router.py 新,§4.1 末)` ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库)← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run)← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底)← `7323b1c`(rerank_mode=union,recall ≥ 粗筛)← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断)← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导)← `0690b43`(dump 合并键 name,_domain)← `999c15d`(reachable-GT 口径)← `74e7207`(归因脚本修复)← `0d31b51/2d258f2`(dump/归因脚本)← `eee7bc5`(batch_route 并发)。
 
 ---
 
 ## 4. 最近两个会话的工作(2026-08-31 ~ 09-03,★ 新对话"重新优化方案"的直接原料)
 
-### 4.1 未提交 diff(git status:3 改 + 2 新测试 + 1 数据)
+### 4.1 执行期鲁棒性 + 意图级检索(✅ 已提交;diff 拆 2 commit,用户确认全提交)
+
+下述 diff 已在 2026-09-03 会话按用户选择拆为两个 commit 提交(`9a04a3d` 鲁棒性 + `2c2b62f` 意图检索,含 docs 与 tools_dump.json 入库),提交后 worktree clean:
 ```
- M benchmark/tool_router.py      (+47) 新增 ToolRouter.search()/search_tools()(执行期意图级检索 API)
- M orchestrators/base.py         ( 7)  _execute_tool_call 未知名:去掉"静默回退第一个 gym"→ raise ValueError(带工具名)
- M orchestrators/react_router.py (+178) 执行循环 try/except + 意图级检索触发点 A/B/C
-?? tests/test_react_router.py    (新,7 用例:触发点 A/B/C、安全边界、退化路径)
-?? tests/test_tool_router.py     (追加 TestIntentSearch 6 用例)
-?? tools_dump.json
+9a04a3d fix(orchestrators): exec-loop robustness - tool failures no longer abort a run
+        (base.py 未知名 raise 带工具名;react_router 执行循环 try/except 回喂)
+2c2b62f feat(router): intent-level retrieval (ToolRouter.search) + exec-loop triggers A/C
+        (benchmark/tool_router.py +47;orchestrators/react_router.py +178;
+         tests/test_react_router.py 7 例 + test_tool_router.py TestIntentSearch 6 例;tools_dump.json)
 ```
+⚠️ 本会话后续的 **Meta-Tool 落地 diff 尚未提交**:`M benchmark/tool_router.py`(+5,inputSchema 双兼容)+ `M evaluate.py`(+34)+ `M eval_router.py`(+256)+ `?? orchestrators/meta_tool_router.py`(新)。`tests/` 目录按既有策略仍在 `.git/info/exclude`(不入库)。功能有效、单测 51/51,建议一个功能 commit(§6 #1)。
 
 ### 4.2 背景与动机(意图级检索是用户亲自推动的设计质疑)
 - **名字级发现(旧 `_discover_if_needed`)的缺陷链**:`llm_client.py` ~L415 `bind_tools` 只绑定活跃子集 → 严格 function-calling 下模型**发不出子集外名字** → 名字级发现永不触发;旧 `base._execute_tool_call` 未知名静默回退第一个 gym 或 raise → 异常冒泡炸整轮 run。
@@ -90,12 +92,14 @@
 - 与旧 `_discover_if_needed` 关系:保留(便宜,精确命中直接执行);意图级检索负责"模型无法点名"的补盲。
 
 ### 4.4 测试与验证状态
-- 全量 **40/40 通过**(新增 13 例):触发点 A/B/C 各场景、正常收尾不误触、幻觉名零命中不致命、关闭 discovery 退化不炸、**安全"只加不执行"实证(mcp.calls==[])**、search API 排序/top_k/min_score/boost_lookup 一致性、便捷函数与实例同源。
-- 无 LLM key/容器 → **意图级检索对任务成功率的端到端增益仍未量化**(最大验证空白)。
+- 全量 **51/51 通过**(意图级检索相关 40 例 + Meta-Tool 11 例,§4.5.5):触发点 A/B/C 各场景、正常收尾不误触、幻觉名零命中不致命、关闭 discovery 退化不炸、**安全"只加不执行"实证(mcp.calls==[])**、search API 排序/top_k/min_score/boost_lookup 一致性、便捷函数与实例同源;Meta-Tool 闭环/兜底/缓存/并行/预热见 §4.5.5。
+- 无 LLM key/容器 → **对任务成功率的端到端增益仍未量化**(最大验证空白,服务端可跑)。
 
 ---
 
-## 4.5 新方向(用户已选定):元工具 (Meta-Tool) 模式 — 参考 Spring AI Alibaba
+## 4.5 新方向(✅ 已实现落地,2026-09-03):元工具 (Meta-Tool) 模式 — 参考 Spring AI Alibaba
+
+> 状态:本节 4.5.1-4.5.4 为原始设计(保留供对照);**实施结果、9 个设计问题的定调、测试与离线数字见 §4.5.5**。
 
 ### 4.5.1 Spring AI Alibaba 做法(来源:用户提供的元工具介绍截图)
 
@@ -140,34 +144,60 @@
 8. **评估口径**:`eval_router.py` 离线 + `evaluate.py` 端到端双跑;新增元数据字段 `meta_tool_searches`(检索次数)、`meta_tool_hits_avg`(平均命中数)、`meta_tool_cache_hits`。
 9. **意图级检索(原触发点 A/B/C)的去留**:建议 **保留 B(异常 try/except)**,**简化为单点 C 兜底**(零命中时回喂"还有别的工具吗")而非三类分散触发;或作为 Meta-Tool 的 fallback 子模块,逐步收敛。
 
+### 4.5.5 实施落地(2026-09-03 本会话;§4.5.4 九个问题的定调与结果)
+
+**交付清单**(未提交,见 §4.1 末):
+- `orchestrators/meta_tool_router.py`(新,~520 行):`MetaToolOrchestrator`。核心机制 = 首轮 `_visible_tools()` 只 bind `[_tool_search]`;LLM 显式调用 `_tool_search(query, top_k?)` → `_handle_tool_search` 拦截 → `ToolRouter.search()`(复用 __init__ 索引,零新检索代码)→ 命中工具 `_admit()` 并入注入集 → **下一轮 bind `[_tool_search] + 已注入 defs`** → 模型显式调用真实工具 → `base._execute_tool_call` 执行。`_tool_search` 定义走 MCP 标准 `inputSchema`(驼峰)。
+- `evaluate.py`:`ORCHESTRATOR_MAP["meta_tool"] = MetaToolOrchestrator`;CLI `--meta_tool_top_k`(默认 6)/`--meta_tool_min_score`(默认 0.03)/`--meta_warmup_top_k`(默认 None)。
+- `eval_router.py`:`simulate_meta_tool()`(任务文本切段模拟逐轮 `_tool_search`,统计 final_recall/first_recall/hits_avg/zero%/full_cov/precision)+ `analyze_meta_tool_runs()`(聚合 evaluate.py `results_*.json` 的 run 级 `meta_tool_*`);CLI `--meta_sim`/`--meta_sim_top_k`/`--meta_sim_min_score`/`--meta_sim_max_searches`/`--analyze_meta_runs`。
+- `benchmark/tool_router.py`(+5):`build_tool_signature` 对 `inputSchema`/`input_schema` 双兼容(小写优先、驼峰 fallback)。
+- `tests/test_meta_tool_router.py`(新,11 例,全量 51/51 通过)。
+
+**§4.5.4 九个问题 → 落地口径**:
+
+| # | 设计问题 | 落地口径 |
+|---|---|---|
+| 1 | 注入方式 | **bind 动态扩 + [system] 文本说明双管齐下**。每轮 `invoke_with_tools(messages, visible)` 重新 bind → orchestrator 传 `[_tool_search]+已注入 defs` 即实现 mid-conversation 动态扩,**对 LLMClient 零改动**;新工具首注时追加一条 `[system] "now bound and callable…"` HumanMessage(插在全部 ToolMessage 之后),重复检索零噪音 |
+| 2 | 检索后端 | V1 = `ToolRouter.search`(TF-IDF,零新代码);V2 换 embedding 只改 `TFIDFIndex`,路径不变 |
+| 3 | 缓存策略 | `OrderedDict` LRU(默认 64 条)同会话 query→hits;**不跨任务**;命中计数 `cache_hits` 入元数据 |
+| 4 | 并发 tool_call | 一轮内多个 tool_call 依序处理(`_tool_search` 拦截 + 真实工具执行),注入说明统一追加在本轮全部 ToolMessage 之后;并行场景有单测 |
+| 5 | 回退路径 | 零命中 → 回喂 `count=0 + "Rephrase…"` 引导,**绝不中断**;连续零命中达 `fallback_all_after_zero_hits`(默认 3)→ 兜底 bind 全池防死锁(`None`=关闭兜底,只回喂) |
+| 6 | 预热/混合 | 预留 `warmup_top_k`(默认 **None = 纯 Meta-Tool 单通道**,先验证假设);非 None 时 `__init__` 即注入 `route(user_prompt)` 粗筛 top-k,与 `_tool_search` 并存 |
+| 7 | 大池/小池 | search 复用 `__init__` TF-IDF 索引,域内池 60-90 工具毫秒级;512 全池同构可用 |
+| 8 | 评估口径 | orchestrator `get_result_metadata()` 输出 `meta_tool_search_calls / searches / cache_hits / hits_avg / zero_hits / injected / fallback_all / warmup_names`,evaluate.py 按 run 落盘;eval_router.py `--meta_sim`(离线仿真)+ `--analyze_meta_runs`(端到端产物聚合)双通道 |
+| 9 | A/B/C 去留 | Meta-Tool 自身保留 **exec_error try/except**(=原 B,单次失败不炸 run);池外点名(=原 A)改为**非致命回错误 + 引导回 `_tool_search`**;text_gap(=原 C)被显式 `_tool_search` 取代(何时检索完全交给 LLM)。`react_router` 双轨保留,供同模型同 split 端到端对照 |
+
+**安全边界(硬性,代码注释 + 单测双锁)**:`_tool_search` 只读——拦截后只打分/返回/注入可见集,**绝不自动执行**真实工具(写副作用必须由模型后续显式调用);检索输入仅本轮 LLM 调用参数(query),**不读** `selected_tools`(执行时读 = 答案泄露)。
+
+**离线仿真数字**(真实池 13 任务 csm12+itsm1,top_k=6,min_score=0.03,≤4 轮;`eval_router.py --meta_sim`):final_recall **27.5%** / first_recall 6.9% / hits_avg 1.20 / zero% 6.0% / full_cov 0.0% / precision 20.5%。⚠️ **诚实口径**:仿真 query 由任务文本自动切段(非 LLM 生成)→ 数字是检索器对"分批能力片段"query 的覆盖**下界/诊断**,不是端到端增益;后者需服务端 `evaluate.py --orchestrator meta_tool`。
+
 ---
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
 
-1. **【已决策 · 路线确立】工具调用主通道改为元工具(Meta-Tool)模式**(详见 §4.5):严格 function-calling 下 bind_tools 限制问题由"事后补救"改为"事前内置为合法调用",原 §5.1 由"未决"升格为"已选方案";**子问题见 §4.5.4,新会话需逐项定调**。
-2. **【待决策】LOOKUP_FLOOR 默认值**:0.08 → 0.15?(真实池扫描 0.15 显著提 recall;暴露数 20→30,靠 LLM 精排兜截断)。
+1. **【已落地】工具调用主通道采用元工具(Meta-Tool)模式**(详见 §4.5):`MetaToolOrchestrator` 已实现并注册;9 个设计子问题的定调见 §4.5.5 表格。剩余 = 端到端增益验证(服务端)与双轨收敛决策(§6)。
+2. **【待决策】LOOKUP_FLOOR 默认值**:0.08 → 0.15?(真实池扫描 0.15 显著提 recall;暴露数 20→30,靠 LLM 精排兜截断)。Meta-Tool 的 `boost_lookup` 默认 False(与 react_router 只读启发式对齐,是否默认开待数据)。
 3. **【待决策】TF-IDF 是否替换为向量检索**:上会话结论 = **暂不换**(本节事实未变);Meta-Tool 模式下 query 改为 LLM 自生成的关键词,词法重叠可能更不稳定,替换优先级比之前略升。决策仍须先有错误归因数据;廉价中间态:字符级模糊 + 领域同义词表。V2 升级仍仅换 `TFIDFIndex`。
-4. **【初值未调】** `_tool_search` 的 top_k / min_score / 缓存上限 / 命中阈值均待定;无触发率/误触发率统计。
-5. **【状态机重构空间】** 元工具模式下 `meta_tool_router.py` 需管理 query→tools 缓存、注入集合、回退集合三类状态;可借鉴 `react_router.py` 的简洁写法。
-6. **【潜在 bug,未验证】** LLM 一次发多个 tool_call(包含 `_tool_search` 与其它)时的并行处理、tool_call_id 匹配需实测。
+4. **【初值未调,已有默认+仿真诊断】** `_tool_search` top_k=6/min_score=0.03/缓存 64/零命中兜底 3 均为拍脑袋初值;`eval_router.py --meta_sim` 已能离线诊断检索器覆盖,**真实 LLM 触发率/误触发率需服务端端到端统计**。
+5. **【状态机已实现】** `meta_tool_router.py` 已管理 query→tools 缓存(LRU)、注入集合(保序)、回退集合/兜底标志三类状态,风格同 `react_router.py`。
+6. **【潜在 bug,已单测覆盖】** LLM 一次发多个 tool_call(含 `_tool_search` 与真实工具)的并行处理、注入说明在 ToolMessage 之后插入 —— 已由 test_meta_tool_router.py 覆盖;tool_call_id 真实端到端匹配仍需服务端验证。
 7. **【文档欠账】** 意图级检索 + 元工具模式均未写进 `docs/tool_router_design.md`;新方案定稿后应回填一节"Meta-Tool 模式"。
 
 ---
 
-## 6. 下一步候选(按 ROI;新对话选定方向 = 元工具模式)
+## 6. 下一步候选(按 ROI;2026-09-03 后,Meta-Tool 已实现)
 
-| # | 任务 | 前置 | 价值 |
+| # | 任务 | 前置 | 状态/价值 |
 |---|---|---|---|
-| 1 | **未提交 diff 提交决策**(建议拆 2 commit:鲁棒性 / 意图检索 + 测试;若决定不再发展意图检索,可一起 squash) | 无 | 仓库卫生,防丢失 |
-| 2 | tools_dump.json 入库或加 .gitignore | 无 | 数据可复现 |
-| 3 | **【P0】设计 MetaToolOrchestrator(orchestrators/meta_tool_router.py)**:只 bind `_tool_search` 工具;拦截其调用 → `ToolRouter.search()` → 注入命中工具 schemas;**先采用 V1 文本注入方案(零侵入)**,对比后再升级到 bind_tools 动态扩 | 读 `llm_client.py:bind_tools` 流 | **新方案核心**,严格 function-calling 下彻底打通 |
-| 4 | **【P0】端到端对照** react_router vs meta_tool_router(同模型同 split;服务端) | conf/llm key + 容器 | **新方案增益量化**(最大空白) |
-| 5 | **【P1】查询缓存 + 命中阈值调优**:query→tools 缓存防重复检索;top_k/min_score 参数扫描 | #3 | 稳定性 + 延迟 |
-| 6 | **【P1】评估埋点**:`meta_tool_searches` / `meta_tool_hits_avg` / `meta_tool_cache_hits`;eval_router 新增 Meta-Tool 离线指标 | #3 | 支撑 #7 决策 |
-| 7 | **【P2】TF-IDF → embedding 升级实验**:Meta-Tool 模式下 query 是 LLM 自生成关键词,词法重叠更不稳定;错误归因三分(词法/语义/池外) + rapidfuzz 对比 | #4 数据 | V2 是否值得换 |
-| 8 | **【P2】意图级检索触发点 A/C 收敛**:保留 B(异常 try/except);A/C 转为 Meta-Tool 的 fallback 子模块或删除 | #3 | 减少双轨维护 |
-| 9 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #3 决策 | 即得 recall 增益 |
-| 10 | 回归测试补齐:Meta-Tool 单元测试(mock LLM 序列)、并行 tool_call、缓存命中 | 无 | 质量 |
+| 1 | **提交本次 Meta-Tool 落地 diff**(单功能 commit:tool_router.py +5 / evaluate.py +34 / eval_router.py +256 / meta_tool_router.py 新) | 无 | 仓库卫生,防丢失 |
+| 2 | **【P0】服务端端到端对照** react_router vs meta_tool_router(同模型同 split/同 concurrency,口径写明) | conf/llm key + 容器 | **新方案增益量化**(最大空白) |
+| 3 | **【P1】README / 作品集回填**:如实标注 Meta-Tool 模式(实现 + 设计问题定调 + 离线下界数字,防面试深挖翻车) | #1 | 面试呈现 |
+| 4 | **【P1】`_tool_search` 参数调优**:top_k / min_score / 缓存 / 零命中兜底阈值的触发率与误触发率统计(可先用 `--meta_sim` 扫描检索器,再服务端验证 LLM 行为) | #2 数据 | 稳定性 + 延迟 |
+| 5 | **【P2】TF-IDF → embedding 升级实验**:Meta-Tool 模式下 query 是 LLM 自生成关键词,词法重叠更不稳定;错误归因三分(词法/语义/池外) + rapidfuzz 对比 | #2 数据 | V2 是否值得换 |
+| 6 | **【P2】双轨收敛**:react_router vs meta_tool_router 对照后决定去留;意图级检索 A/C 在 meta_tool 下已被显式 `_tool_search` 取代,B(异常)两者均保留 | #2 数据 | 减少双轨维护 |
+| 7 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #2 数据 | 即得 recall 增益 |
+
+✅ 已完成(2026-08-31~09-03):执行期鲁棒性 + 意图级检索(A/B/C)拆 2 commit 提交(9a04a3d/2c2b62f);`MetaToolOrchestrator` 实现 + evaluate.py 注册 + eval_router.py 离线指标(埋点/meta_sim/analyze_meta_runs);tests/test_meta_tool_router.py 11 例,全量 **51/51**;tools_dump.json 入库。
 
 长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正 → 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
 
@@ -183,4 +213,4 @@
 - 记忆:`.workbuddy/memory/2026-09-03.md`(ToolLLM 调研+意图检索落地+TF-IDF 结论)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
 
 ---
-*本文档由 2026-09-03 会话生成(用户选定元工具 Meta-Tool 模式后二次更新),供新会话无缝接手。新方案定稿后请回填设计文档并更新本文档。*
+*本文档由 2026-09-03 会话生成并更新(Meta-Tool 模式定稿落地后第三次更新:意图级检索已提交、MetaToolOrchestrator 已实现、51/51 单测通过),供新会话无缝接手。实现状态均已如实标注;服务端端到端验证完成后请回填数字。*
