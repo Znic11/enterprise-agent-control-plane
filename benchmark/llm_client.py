@@ -265,8 +265,19 @@ class LLMClient:
             logger.info(f"Initialized {self.provider} LLM: {self.model}")
 
         except ImportError as e:
+            # provider 的 langchain 集成都是可选依赖(pyproject [project.optional-dependencies]),
+            # 装错 extra/漏装是服务端最常见的启动失败。给出可操作提示而非裸 traceback。
+            _extra = {
+                "anthropic": "anthropic", "ustc": "anthropic",  # ustc = Anthropic 兼容网关
+                "openai": "openai", "google": "google",
+                "deepseek": "deepseek", "qwq": "qwq",
+            }.get(self.provider, self.provider)
             logger.error(
-                f"Failed to import LangChain provider for {self.provider}: {e}"
+                f"Failed to import LangChain provider for {self.provider}: {e}\n"
+                f"  → 该 provider 的集成是可选 extra,请安装: "
+                f"uv sync --extra {_extra}  或  pip install '.[{_extra}]'"
+                f"(ustc 走 Anthropic 兼容协议,对应 anthropic extra;"
+                f"与 dense 检索可一起装: uv sync --extra dense --extra anthropic)"
             )
             raise
 
