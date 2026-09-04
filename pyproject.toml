@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Benchmarking framework for evaluating LLMs on enterprise agentic tasks."
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.9.0",
     "httpx>=0.25.0",
     "langchain>=0.1.0",
     "langchain-core>=0.1.0",
+    "nest_asyncio>=1.6.0",
     "ray>=2.53.0",
     "datasets>=4.5.0",
     "huggingface_hub>=1.3.2",
