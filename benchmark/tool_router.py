@@ -5,15 +5,17 @@
   * orchestrators/tool_router.py —— 关键词 + LLM 路由(函数 API,已并入)
 
 统一后的三级漏斗(docs/tool_router_design.md):
-  ② 粗筛   TF-IDF 余弦 top-30(k_candidate),置信度低于 min_score 回退全量(⑤)
+  ② 粗筛   检索后端(默认 Hybrid = 稠密向量 + TF-IDF 融合,可切 tfidf/dense;
+            置信度低于 min_score 回退全量 ⑤)
   ③ 精排   可选轻量 LLM 在候选集内重选(注入 llm_call_fn,provider 无关);
-            解析失败 / 选中 <5 个 → 回退 TF-IDF 子集
-  兜底     route_keywords(纯关键词重叠,零成本,只在 TF-IDF 完全失效时作为
+            解析失败 / 选中 <5 个 → 回退检索子集
+  兜底     route_keywords(纯关键词重叠,零成本,只在检索完全失效时作为
            最后手段,也供离线消融对比)
 
 用法:
-    # orchestrator 内(推荐,索引只建一次)
-    router = ToolRouter(tools)
+    # orchestrator 内(推荐,索引只建一次;检索后端可插拔)
+    router = ToolRouter(tools)                                  # tfidf(纯 stdlib)
+    router = ToolRouter(tools, retrieval="hybrid", embedder=embedder)  # 稠密+稀疏融合
     subset, meta = router.route(task_text)
 
     # 便捷函数(每次调用即建索引;512 工具量级下开销可忽略)
@@ -24,7 +26,15 @@
 诚实性边界:route() 只接受任务文本与工具定义,不读取任务配置的
 selected_tools 字段(那是离线评估用的 ground truth,执行时读=答案泄露)。
 
-V2 升级点:把 TFIDFIndex 换成 sentence-transformers embedding 余弦,接口不变。
+检索后端(retrieval):
+  * "tfidf"  —— 稀疏 TF-IDF 余弦(纯 stdlib,零依赖;默认,保底与离线一致性)
+  * "dense"  —— 稠密向量余弦(见 benchmark/dense_retriever.py,sentence-transformers
+                可选依赖;捕获"语义相近但词面零重叠"的意图)
+  * "hybrid" —— 稠密+稀疏加权融合:稀疏兜工具名/参数键的精确词面匹配,稠密兜
+                同义换词的语义泛化。融合分 = alpha*稠密(min-max 归一) +
+                (1-alpha)*稀疏。稠密按查询在全池上 min-max 归一到 [0,1],使
+                alpha 权重与稀疏余弦量纲可比;top-k 截断把噪声限制在可见集之外。
+                企业工具名/参数名是强词面信号,纯稠密会丢 —— 故默认 hybrid。
 """
 
 from __future__ import annotations
@@ -42,6 +52,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOP_K = 20
 DEFAULT_K_CANDIDATE = 30
 MIN_LLM_SELECTED = 5  # LLM 精排选中数低于此值 → 回退粗筛子集(宁多勿少)
+
+RETRIEVAL_MODES = ("tfidf", "dense", "hybrid")
+DEFAULT_HYBRID_ALPHA = 0.5  # hybrid 融合中稠密权重(1-alpha 为稀疏权重)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +182,13 @@ LOOKUP_FLOOR = 0.08
 
 
 class ToolRouter:
-    """TF-IDF 粗筛路由。route() 返回 (子集工具列表, 元数据)。"""
+    """可插拔检索后端路由。route() 返回 (子集工具列表, 元数据)。
+
+    Args:
+        retrieval: "tfidf"(纯 stdlib 稀疏,默认)/ "dense"(稠密)/ "hybrid"(融合)。
+        embedder: retrieval != "tfidf" 时的 TextEmbedder 实例(见 dense_retriever)。
+        hybrid_alpha: hybrid 中稠密通道权重;稀疏权重 = 1 - alpha。
+    """
 
     def __init__(
         self,
@@ -177,13 +196,37 @@ class ToolRouter:
         k_candidate: int = DEFAULT_K_CANDIDATE,
         k_final: int = DEFAULT_TOP_K,
         min_score: float = 0.05,
+        retrieval: str = "tfidf",
+        embedder: Any = None,
+        hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
     ):
         if k_candidate < 1 or k_final < 1:
             raise ValueError(f"k_candidate/k_final must be >= 1, got {k_candidate}/{k_final}")
+        if retrieval not in RETRIEVAL_MODES:
+            raise ValueError(
+                f"retrieval must be one of {RETRIEVAL_MODES}, got {retrieval!r}"
+            )
+        if retrieval != "tfidf" and embedder is None:
+            raise ValueError(
+                f"retrieval={retrieval!r} requires embedder= (a TextEmbedder); "
+                "see benchmark.dense_retriever.get_embedder()"
+            )
+        if not 0.0 <= hybrid_alpha <= 1.0:
+            raise ValueError(f"hybrid_alpha must be in [0,1], got {hybrid_alpha}")
         self.tools = tools
         self.by_name = {t["name"]: t for t in tools}
         docs = {t["name"]: build_tool_signature(t) for t in tools}
-        self.index = TFIDFIndex(docs)
+        self.retrieval = retrieval
+        self.hybrid_alpha = hybrid_alpha
+        # 稀疏索引(hybrid 需要;纯 dense 不需要,避免无谓构建)
+        self.index = TFIDFIndex(docs) if retrieval in ("tfidf", "hybrid") else None
+        self._sparse = self.index
+        # 稠密索引(dense/hybrid 需要;懒 import numpy 与 dense_retriever)
+        self._dense = None
+        if retrieval != "tfidf":
+            from .dense_retriever import DenseIndex
+
+            self._dense = DenseIndex(embedder, docs)
         # k_candidate(LLM 精排的候选输入池)与 k_final(粗筛输出数)解耦:
         # 二者可独立,k_final > k_candidate 在纯粗筛/饱和曲线实验里合法(输出给足
         # k_final,精排阶段才在 k_candidate 候选内收敛)。旧实现 hits[:k_final] 从
@@ -192,13 +235,53 @@ class ToolRouter:
         self.k_final = k_final
         self.min_score = min_score
 
+    # ------------------------------------------------------------------
+    # 全池打分(检索后端在此分派;不做截断/回退/boost,由上层决定)
+    # ------------------------------------------------------------------
+
+    def _rank_all(self, query: str) -> List[Tuple[float, str]]:
+        """返回全池按检索后端排序的 [(score, name)],score 越大越相关。
+
+        - tfidf: 稀疏余弦(TFIDFIndex.search 全池版)。
+        - dense: 稠密余弦(DenseIndex.search_all 全池版,原始余弦可能为负)。
+        - hybrid: 稠密(min-max 归一到 [0,1])与稀疏按 alpha 加权融合。
+          稠密 min-max 归一:两通道量纲不可比(稀疏余弦对短 query 会出 0.9+ 的
+          尖峰,稠密余弦对相关文档通常在 0.2-0.6),不归一的话 alpha 形同虚设;
+          归一到 [0,1] 后 alpha 才是真正可解释的权重。top-k 截断在上层做,
+          融合噪声最多进入可见集前 k 名,不会无限放大。
+        """
+        if not query or not query.strip():
+            return []
+        sparse = self._sparse.search(query, top_k=len(self.tools)) if self._sparse else None
+        if self.retrieval == "tfidf":
+            return sparse or []
+        dense = self._dense.search_all(query) if self._dense is not None else []
+        if self.retrieval == "dense":
+            return dense or []
+        # hybrid 融合(两通道都齐)
+        ss = {n: s for s, n in (sparse or [])}
+        ds = {n: s for s, n in dense}
+        lo = min(ds.values()) if ds else 0.0
+        hi = max(ds.values()) if ds else 0.0
+        span = hi - lo
+        fused = {}
+        for name in self.by_name:
+            if span > 1e-9:
+                dnorm = (ds.get(name, lo) - lo) / span
+            else:  # 稠密全等(退化,如单工具池)→ 稠密无信息,视为 0
+                dnorm = 0.0
+            fused[name] = self.hybrid_alpha * dnorm + (1.0 - self.hybrid_alpha) * ss.get(name, 0.0)
+        # 契约是 [(score, name)];fused.items() 是 (name, score),需翻转
+        return [(s, n) for n, s in sorted(fused.items(), key=lambda kv: kv[1], reverse=True)]
+
     def route(self, task_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         # 先在全池上打分(地板分要作用于全池,0 分 lookup 才有机会入选)
-        raw = self.index.search(task_text, top_k=len(self.tools))
+        raw = self._rank_all(task_text)
         if not raw or raw[0][0] < self.min_score:
             # ⑤ 置信度回退:语义差异过大,回退全量(执行不至于全灭)
             return self.tools, {
                 "fallback": "low_confidence",
+                "retrieval": self.retrieval,
                 "top_score": raw[0][0] if raw else 0.0,
                 "subset_size": len(self.tools),
             }
@@ -210,6 +293,7 @@ class ToolRouter:
         out = boosted[: self.k_final]                            # 粗筛输出(≥候选时给足)
         subset = [self.by_name[n] for _, n in out]
         return subset, {
+            "retrieval": self.retrieval,
             "candidate_size": len(cand),
             "candidate_names": [n for _, n in cand],
             "subset_size": len(subset),
@@ -229,20 +313,22 @@ class ToolRouter:
         与 route() 的区别:
           * route() 面向"整条任务"做粗筛+可选精排,走完整三级漏斗;
           * search() 面向"执行期单步缺口"(模型想干某事但不会/不能点名工具),
-            只做 TF-IDF 打分返回 top-k,不做截断/回退/精排 —— 由调用方决定
-            如何把命中并入活跃集(react_router 的意图级发现)。
+            只打分返回 top-k,不做截断/回退/精排 —— 由调用方决定如何把命中并
+            入可见集(meta_tool 的 _tool_search 即此通道)。
+        - 后端与 route() 一致:tfidf/dense/hybrid 由构造参数决定。
         - ``boost_lookup=True`` 时对 find_/list_/get_ 前缀加 LOOKUP_FLOOR 地板分,
           与 route() 的只读启发式一致(供"模型只会描述动作不会说动词"场景)。
         - 复用 __init__ 建好的索引,零额外构建开销;纯 CPU 毫秒级。
         """
         if not query or not query.strip():
             return []
-        raw = self.index.search(query, top_k=top_k)
+        raw = self._rank_all(query)
+        top = raw[:top_k]
         if boost_lookup:
-            raw = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n)
-                   for s, n in raw]
-            raw.sort(reverse=True)
-        return [(round(s, 4), n) for s, n in raw if s >= min_score]
+            top = [(s + LOOKUP_FLOOR if n.startswith(LOOKUP_PREFIXES) else s, n)
+                   for s, n in top]
+            top.sort(reverse=True)
+        return [(round(s, 4), n) for s, n in top if s >= min_score]
 
 
 def search_tools(
@@ -251,15 +337,21 @@ def search_tools(
     top_k: int = 10,
     min_score: float = 0.0,
     boost_lookup: bool = False,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ) -> List[Tuple[float, str]]:
     """便捷函数:给定能力需求文本与全工具池,返回最相关的 (score, name)。
 
-    每次调用重建一次 TF-IDF 索引(512 工具量级毫秒级)。执行期高频触发请直接
-    持有 ``ToolRouter`` 实例并调用 ``.search()``(见 ToolRouter.search 文档)。
+    每次调用重建一次检索索引(512 工具量级毫秒级;dense/hybrid 需 embedder,
+    见 benchmark/dense_retriever)。执行期高频触发请直接持有 ``ToolRouter``
+    实例并调用 ``.search()``(见 ToolRouter.search 文档)。
     """
     if not all_tools or not query or not query.strip():
         return []
-    router = ToolRouter(all_tools)
+    router = ToolRouter(
+        all_tools, retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha
+    )
     return router.search(
         query, top_k=top_k, min_score=min_score, boost_lookup=boost_lookup
     )
@@ -418,7 +510,7 @@ class RouteResult:
     """一次路由的结果 + 诊断信息(供审计与实验归因)。"""
 
     selected: List[str] = field(default_factory=list)
-    method: str = "tfidf"  # "tfidf" | "tfidf+llm" | "full_fallback" | "empty"
+    method: str = "tfidf"  # "<retrieval>" | "<retrieval>+llm" | "full_fallback" | "empty"; retrieval=tfidf/dense/hybrid
     full_tool_count: int = 0
     task_text: str = ""
     candidate_size: int = 0
@@ -439,6 +531,11 @@ class RouteResult:
         }
 
 
+def _retrieval_label(retrieval: str) -> str:
+    """日志用显示名:tfidf 沿用旧文案(TF-IDF),dense/hybrid 直用其名。"""
+    return "TF-IDF" if retrieval == "tfidf" else retrieval
+
+
 def route(
     task_text: str,
     all_tools: List[Dict[str, Any]],
@@ -447,16 +544,21 @@ def route(
     prefer_llm: bool = False,
     rerank_mode: str = "strict",
     candidate_k: Optional[int] = None,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ) -> RouteResult:
-    """统一路由入口:TF-IDF 粗筛 →(可选)LLM 精排 → 兜底。
+    """统一路由入口:检索粗筛 →(可选)LLM 精排 → 兜底。
 
+    - 检索后端由 ``retrieval`` 决定("tfidf" 默认纯 stdlib / "dense" / "hybrid",
+      见 ToolRouter 与 benchmark/dense_retriever.py);``embedder`` 在非 tfidf 时必填。
     - 粗筛置信度低 → 回退全量工具(method="full_fallback")
     - prefer_llm 且提供了 llm_call_fn → 在粗筛候选上 LLM 精排;
       LLM 失败或选中 <5 个 → 回退粗筛 top-k 子集
     - rerank_mode:
-        "strict" —— LLM 输出即最终(method="tfidf+llm"),噪声最少,
+        "strict" —— LLM 输出即最终(method="<retrieval>+llm"),噪声最少,
                   但 LLM 砍错会丢必需工具(实测 reasoner 过度截断)
-        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method="tfidf+llm+union"),
+        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method="<retrieval>+llm+union"),
                   精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛。
                   注意:减噪/增补效果取决于 candidate_k > top_k —— 若候选
                   与输出同宽(默认 max(30,top_k)=top_k 时),LLM 只能从保底
@@ -472,9 +574,13 @@ def route(
         return RouteResult(selected=[], method="empty", full_tool_count=0, task_text=task_text)
 
     k_cand = candidate_k if candidate_k else max(DEFAULT_K_CANDIDATE, top_k)
-    router = ToolRouter(all_tools, k_candidate=k_cand, k_final=top_k)
+    router = ToolRouter(
+        all_tools, k_candidate=k_cand, k_final=top_k,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha,
+    )
     subset, meta = router.route(task_text)
     top_score = meta.get("top_score", 0.0)
+    label = _retrieval_label(retrieval)
 
     if meta.get("fallback"):
         names = [t["name"] for t in all_tools]
@@ -491,17 +597,17 @@ def route(
             fallback=meta["fallback"],
         )
 
-    method = "tfidf"
+    method = retrieval
     if prefer_llm and llm_call_fn is not None:
         cand_names = meta.get("candidate_names") or [t["name"] for t in subset]
         cand_tools = [router.by_name[n] for n in cand_names if n in router.by_name]
         llm_names = route_llm(task_text, cand_tools, llm_call_fn, top_k)
         if llm_names is None:
-            logger.warning("[ROUTER] LLM rerank failed; keeping TF-IDF subset")
+            logger.warning(f"[ROUTER] LLM rerank failed; keeping {label} subset")
         elif len(llm_names) < MIN_LLM_SELECTED:
             logger.warning(
                 f"[ROUTER] LLM selected only {len(llm_names)} tools (<{MIN_LLM_SELECTED}); "
-                f"keeping TF-IDF subset"
+                f"keeping {label} subset"
             )
         else:
             if rerank_mode == "union":
@@ -515,14 +621,14 @@ def route(
                     if n not in merged:
                         merged.append(n)
                 subset = [router.by_name[n] for n in merged if n in router.by_name]
-                method = "tfidf+llm+union"
+                method = f"{retrieval}+llm+union"
                 logger.info(
                     f"[ROUTER] union rerank: LLM {len(llm_set)} ∪ coarse {len(merged)} "
                     f"-> {len(subset)} tools (recall floor = coarse)"
                 )
             else:  # strict
                 subset = [router.by_name[n] for n in llm_names if n in router.by_name]
-                method = "tfidf+llm"
+                method = f"{retrieval}+llm"
 
     return RouteResult(
         selected=[t["name"] for t in subset],
@@ -544,11 +650,17 @@ async def batch_route(
     progress_fn: Optional[Callable[[int, int], None]] = None,
     rerank_mode: str = "strict",
     candidate_k: Optional[int] = None,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ) -> Dict[str, RouteResult]:
-    """批量路由:TF-IDF 索引只建一次 + LLM 精排并发执行(语义与 route() 一致)。
+    """批量路由:检索索引只建一次 + LLM 精排并发执行(语义与 route() 一致)。
 
     单任务请用 route()(orchestrator 执行路径);同批多任务(离线评估/
     全量跑)用本函数 —— 否则每任务重建索引、且 LLM 调用串行等网关。
+
+    ``retrieval`` / ``embedder`` / ``hybrid_alpha`` 与 route() 同语义(检索后端
+    可插拔,默认 tfidf;dense/hybrid 时 embedder 必填)。
 
     回退规则与 route() 保持一致(改动需两处同步):
       置信度低 → full_fallback(全量);LLM 失败或选中 < MIN_LLM_SELECTED → 粗筛子集。
@@ -566,12 +678,16 @@ async def batch_route(
 
     # ① 粗筛:索引建一次,纯 CPU,毫秒级/任务
     k_cand = candidate_k if candidate_k else max(DEFAULT_K_CANDIDATE, top_k)
-    router = ToolRouter(all_tools, k_candidate=k_cand, k_final=top_k)
+    router = ToolRouter(
+        all_tools, k_candidate=k_cand, k_final=top_k,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha,
+    )
     coarse = {t: router.route(t) for t in task_texts}
 
     # ② 精排:并发(信号量限流),网关延迟被并发摊平
     sem = asyncio.Semaphore(max(1, concurrency))
     done = [0]
+    label = _retrieval_label(retrieval)
 
     async def _one(task_text: str):
         subset, meta = coarse[task_text]
@@ -585,7 +701,7 @@ async def batch_route(
 
         if llm_call_fn_async is None:  # 纯粗筛
             return task_text, RouteResult(
-                selected=[t["name"] for t in subset], method="tfidf",
+                selected=[t["name"] for t in subset], method=retrieval,
                 candidate_size=meta.get("candidate_size", len(subset)), **common)
 
         cand_names = meta.get("candidate_names") or [t["name"] for t in subset]
@@ -597,11 +713,11 @@ async def batch_route(
             progress_fn(done[0], len(task_texts))
 
         if llm_names is None:
-            logger.warning("[ROUTER] LLM rerank failed; keeping TF-IDF subset")
+            logger.warning(f"[ROUTER] LLM rerank failed; keeping {label} subset")
         elif len(llm_names) < MIN_LLM_SELECTED:
             logger.warning(
                 f"[ROUTER] LLM selected only {len(llm_names)} tools (<{MIN_LLM_SELECTED}); "
-                f"keeping TF-IDF subset"
+                f"keeping {label} subset"
             )
         else:
             if rerank_mode == "union":
@@ -612,18 +728,19 @@ async def batch_route(
                         merged.append(n)
                 subset = [router.by_name[n] for n in merged if n in router.by_name]
                 return task_text, RouteResult(
-                    selected=[t["name"] for t in subset], method="tfidf+llm+union",
+                    selected=[t["name"] for t in subset],
+                    method=f"{retrieval}+llm+union",
                     candidate_size=meta.get("candidate_size", len(subset)),
                     candidate_names=cand_names, **common)
             else:  # strict
                 subset = [router.by_name[n] for n in llm_names if n in router.by_name]
                 return task_text, RouteResult(
-                    selected=[t["name"] for t in subset], method="tfidf+llm",
+                    selected=[t["name"] for t in subset], method=f"{retrieval}+llm",
                     candidate_size=meta.get("candidate_size", len(subset)),
                     candidate_names=cand_names, **common)
 
         return task_text, RouteResult(  # LLM 失败/过少 → 回退粗筛子集
-            selected=[t["name"] for t in subset], method="tfidf",
+            selected=[t["name"] for t in subset], method=retrieval,
             candidate_size=meta.get("candidate_size", len(subset)),
             candidate_names=cand_names, **common)
 

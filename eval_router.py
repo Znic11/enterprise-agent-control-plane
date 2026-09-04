@@ -15,7 +15,7 @@
 
 本脚本是 eval_router.py(TF-IDF 版)与 scripts/eval_router_offline.py(关键词版)
 合并后的唯一评估入口,调用统一路由器 benchmark.tool_router.route()(即
-react_router orchestrator 执行时用的同一入口)。
+meta_tool orchestrator 检索用的同一入口;--retrieval 可切 tfidf/dense/hybrid)。
 
 指标:
     recall@k       = |routed ∩ selected| / |selected|     ← 生死线,目标 ≥ 0.9
@@ -43,7 +43,51 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from benchmark.tool_router import ToolRouter, batch_route, route
+from benchmark.dense_retriever import DEFAULT_EMBEDDING_MODEL, get_embedder
+from benchmark.tool_router import (
+    DEFAULT_HYBRID_ALPHA,
+    RETRIEVAL_MODES,
+    ToolRouter,
+    batch_route,
+    route,
+)
+
+_RETRIEVAL_LABEL = {"tfidf": "TF-IDF", "dense": "Dense", "hybrid": "Hybrid"}
+
+
+def resolve_retrieval(
+    retrieval: str,
+    embedding_model: Optional[str] = None,
+    embedding_device: Optional[str] = None,
+) -> Any:
+    """把 CLI --retrieval(含 "auto")解析为 (retrieval, embedder_or_None)。
+
+    auto:服务端装了 sentence-transformers(可选依赖)就 hybrid,否则 tfidf ——
+    离线诊断工具在缺依赖环境下自动降级并打印说明;显式指定 dense/hybrid 时
+    缺依赖会抛出带安装提示的 ImportError(绝不静默降级)。
+    """
+    import importlib.util
+
+    if retrieval not in (*RETRIEVAL_MODES, "auto"):
+        raise SystemExit(f"--retrieval 必须是 {RETRIEVAL_MODES} 或 auto,got {retrieval!r}")
+    if retrieval == "auto":
+        has_st = importlib.util.find_spec("sentence_transformers") is not None
+        retrieval = "hybrid" if has_st else "tfidf"
+        print(f"(auto: 检索后端 -> {retrieval}"
+              + ("" if has_st else "; 未检测到 sentence-transformers,离线沿用稀疏 TF-IDF"
+                                  ",装 dense 可选依赖后自动切 hybrid)")
+              + ")")
+    if retrieval == "tfidf":
+        return retrieval, None
+    try:
+        embedder = get_embedder(embedding_model or DEFAULT_EMBEDDING_MODEL, embedding_device)
+    except ImportError:
+        print(
+            f"⚠️ 检索后端 {retrieval} 需要可选依赖: pip install '.[dense]' "
+            f"(sentence-transformers + torch);或先 --retrieval tfidf"
+        )
+        raise
+    return retrieval, embedder
 
 # server 名 → dump _domain 的映射(任务 gym_servers_config 里写的是挂载哪些
 # MCP server;这是执行器运行时本来就有的配置,不是答案泄露)。本地样例:
@@ -176,6 +220,9 @@ def _eval_one_variant(
     verbose: bool = True,
     rerank_mode: str = "strict",
     candidate_k: Optional[int] = None,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ) -> Dict[str, Dict[str, float]]:
     """对全部任务跑一遍指定路由配置(batch_route:索引建一次+LLM 并发),
     返回 {domain, ALL} 聚合指标。
@@ -202,6 +249,7 @@ def _eval_one_variant(
             llm_call_fn_async=llm_call_async, concurrency=concurrency,
             progress_fn=_progress if llm_call_async else None,
             rerank_mode=rerank_mode, candidate_k=candidate_k,
+            retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha,
         ))
         if llm_call_async:
             print()
@@ -264,15 +312,21 @@ def evaluate(
     concurrency: int = 8,
     rerank_mode: str = "strict",
     candidate_k: Optional[int] = None,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ) -> None:
     """跑 粗筛 / 粗筛+LLM精排 两组配置并对照(未提供 llm_config_path 时只跑粗筛)。
+
+    ``retrieval``/``embedder``/``hybrid_alpha`` 见 resolve_retrieval:检索后端
+    可插拔,默认 tfidf(离线一致性);dense/hybrid 需 sentence-transformers。
 
     粗筛先跑先出结果;langchain 导入与 client 初始化只在第二轮前发生
     (启动不再被依赖加载阻塞)。LLM 调用并发执行(--concurrency 限流)。
 
     rerank_mode:
         "strict" —— LLM 输出即最终(默认,噪声最少,但 LLM 砍错会丢必需工具);
-        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method=tfidf+llm+union),
+        "union"  —— 精排结果 ∪ 粗筛 top-k 保底(method=<retrieval>+llm+union),
                   精排不可能砍掉粗筛已召回的必需工具 → recall ≥ 纯粗筛,
                   对应『召回优先 + 任务不能因缺工具失败』的生产口径。
     candidate_k: 喂给 LLM 的候选宽度(默认 max(30, top_k))。union 模式下
@@ -284,18 +338,21 @@ def evaluate(
     verbose = len(tasks) <= 50  # 任务多时跳过逐任务明细,只看汇总
     results = {}
     by_prompt_all = {}
+    label = _RETRIEVAL_LABEL.get(retrieval, retrieval)
+    first_label = f"{label} 粗筛"
 
     # 变体 1:纯粗筛(纯 CPU,毫秒级/任务)
-    print(f"\n{'#' * 66}\n# 变体: TF-IDF 粗筛(top_k={top_k})\n{'#' * 66}")
+    print(f"\n{'#' * 66}\n# 变体: {first_label}(top_k={top_k})\n{'#' * 66}")
     t0 = time.perf_counter()
-    results["TF-IDF 粗筛"], by_prompt_all["TF-IDF 粗筛"] = _eval_one_variant(
-        tasks, pools, top_k, llm_call_async=None, verbose=verbose)
+    results[first_label], by_prompt_all[first_label] = _eval_one_variant(
+        tasks, pools, top_k, llm_call_async=None, verbose=verbose,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha)
     print(f"(粗筛耗时 {time.perf_counter() - t0:.2f}s)")
 
     if llm_config_path is None:
         if rerank_mode != "strict":
             print(f"(提示: --rerank_mode {rerank_mode} 仅对 LLM 精排生效,本次未提供 --llm_config)")
-        print_variant("TF-IDF 粗筛", results["TF-IDF 粗筛"], top_k, verbose)
+        print_variant(first_label, results[first_label], top_k, verbose)
         _print_targets(top_k)
         return
 
@@ -305,7 +362,7 @@ def evaluate(
     llm_call_async, latencies = build_llm_call_fn(llm_config_path)
     print(f"(加载耗时 {time.perf_counter() - t0:.2f}s)")
 
-    second_name = "粗筛 + LLM 精排" if rerank_mode == "strict" else f"粗筛 + LLM 精排(union)"
+    second_name = f"{label} 粗筛 + LLM 精排" if rerank_mode == "strict" else f"{label} 粗筛 + LLM 精排(union)"
     if candidate_k is not None and candidate_k > top_k and rerank_mode == "union":
         second_name += f" 保底{top_k}+候选{candidate_k}"
     print(f"\n{'#' * 66}\n# 变体: {second_name}(并发={concurrency})\n{'#' * 66}")
@@ -313,11 +370,12 @@ def evaluate(
     results[second_name], by_prompt_all[second_name] = _eval_one_variant(
         tasks, pools, top_k, llm_call_async=llm_call_async,
         concurrency=concurrency, verbose=verbose, rerank_mode=rerank_mode,
-        candidate_k=candidate_k)
+        candidate_k=candidate_k,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha)
     elapsed = time.perf_counter() - t0
     print_variant(second_name, results[second_name], top_k, verbose)
 
-    _print_miss_attribution(tasks, by_prompt_all["TF-IDF 粗筛"],
+    _print_miss_attribution(tasks, by_prompt_all[first_label],
                             by_prompt_all[second_name], verbose)
 
     if latencies:
@@ -328,9 +386,9 @@ def evaluate(
               f"mean={sum(lat)/n:.2f}s | 串行总计≈{sum(lat):.1f}s,并发后实际 {elapsed:.1f}s")
 
     # 消融对照
-    a1 = results["TF-IDF 粗筛"]["ALL"]
+    a1 = results[first_label]["ALL"]
     a2 = results[second_name]["ALL"]
-    print(f"\n=== 消融对照(粗筛 -> {second_name})===")
+    print(f"\n=== 消融对照({first_label} -> {second_name})===")
     print(f"  recall@{top_k}: {a1['tp']/a1['n_sel']:.1%} -> {a2['tp']/a2['n_sel']:.1%} "
           f"({a2['tp']/a2['n_sel'] - a1['tp']/a1['n_sel']:+.1%})")
     print(f"  precision@{top_k}: {a1['tp']/a1['n_pred']:.1%} -> {a2['tp']/a2['n_pred']:.1%} "
@@ -439,6 +497,9 @@ def simulate_meta_tool(
     min_score: float = 0.03,
     max_searches: int = 4,
     verbose: bool = True,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
 ):
     """Meta-Tool 离线仿真:模拟执行期逐轮 ``_tool_search(query)`` 的检索形态。
 
@@ -453,7 +514,7 @@ def simulate_meta_tool(
 
     返回 (聚合 {domain:…, ALL:…}, 每任务明细)。诚实口径:仿真 query 非 LLM
     生成,数字只用于诊断检索器与参数(端到端增益需服务端 evaluate.py
-    --orchestrator meta_tool)。
+    --orchestrator meta_tool)。``retrieval``/``embedder`` 见 resolve_retrieval。
     """
     routers: Dict[str, ToolRouter] = {}
     pool_names: Dict[str, set] = {}
@@ -462,7 +523,10 @@ def simulate_meta_tool(
     def _router(key: str) -> Tuple[ToolRouter, set]:
         if key not in routers:
             pool = pools.get(key) or next(iter(pools.values()), [])
-            routers[key] = ToolRouter(pool)
+            routers[key] = ToolRouter(
+                pool,
+                retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha,
+            )
             pool_names[key] = {x["name"] for x in pool}
         return routers[key], pool_names[key]
 
@@ -625,11 +689,21 @@ def analyze_meta_tool_runs(
               f"{'Y' if r.get('meta_tool_fallback_all') else '-':>9}")
 
 
-def inspect_sample(tasks: List[Dict[str, Any]], pools: Dict[str, List[Dict[str, Any]]], top_k: int) -> None:
+def inspect_sample(
+    tasks: List[Dict[str, Any]],
+    pools: Dict[str, List[Dict[str, Any]]],
+    top_k: int,
+    retrieval: str = "tfidf",
+    embedder: Any = None,
+    hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
+) -> None:
     """打印第一个任务的路由明细,便于人工核对漏检。"""
     t = tasks[0]
     pool = pools[t.get("pool_key") or t["domain"]]
-    result = route(t["user_prompt"], pool, top_k=top_k)
+    result = route(
+        t["user_prompt"], pool, top_k=top_k,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=hybrid_alpha,
+    )
     pred = set(result.selected)
     unreach = t.get("unreachable", set())
     miss = (t["selected_tools"] - pred) - unreach
@@ -710,6 +784,17 @@ def main() -> None:
                          "union 模式下必须 > top_k 才有意义:如 --top_k 30 --candidate_k 60,"
                          "粗筛保底 30、LLM 从 60 候选内增补 30-60 区间的必需工具,"
                          "噪声从 60 压到 ~30-45 且召回不掉;候选=输出时 union ≡ 纯粗筛(白付延迟)")
+    # ---- 检索后端(稠密向量检索替换 TF-IDF;参考 Spring AI Alibaba)----
+    ap.add_argument("--retrieval", default="auto", choices=["auto", "tfidf", "dense", "hybrid"],
+                    help="检索后端:auto=装了 sentence-transformers 则 hybrid,否则 tfidf"
+                         "(默认);tfidf=稀疏(零依赖,旧口径);dense=纯稠密向量;"
+                         "hybrid=稠密+稀疏加权融合(推荐,dense/hybrid 需 pip install '.[dense]')")
+    ap.add_argument("--embedding_model", default=None,
+                    help=f"稠密向量模型(默认 {DEFAULT_EMBEDDING_MODEL},英文轻量;中文任务可换多语模型)")
+    ap.add_argument("--embedding_device", default=None, help="cuda / cpu(默认 auto)")
+    ap.add_argument("--hybrid_alpha", type=float, default=DEFAULT_HYBRID_ALPHA,
+                    help="hybrid 融合中稠密权重(默认 0.5;稀疏权重=1-alpha)。"
+                         "调高=更偏语义,调低=更偏词面精确匹配")
     # ---- Meta-Tool 离线指标(仿真 + 运行日志聚合)----
     ap.add_argument("--meta_sim", action="store_true",
                     help="跑 Meta-Tool 离线仿真:任务文本切段模拟逐轮 _tool_search,"
@@ -726,6 +811,11 @@ def main() -> None:
                          "(results_*.json 的 run 级 meta_tool_* 元数据);可选传入 "
                          "--data_dir 任务以计算 final_recall(GT 仅离线用)")
     args = ap.parse_args()
+
+    retrieval, embedder = resolve_retrieval(
+        args.retrieval, args.embedding_model, args.embedding_device
+    )
+    args.retrieval = retrieval  # 供后续调用透传(auto 已解析为具体后端)
 
     tasks = load_tasks(args.data_dir)
     if not tasks:
@@ -839,10 +929,14 @@ def main() -> None:
 
     print(f"{'domain':<8} {'task':<28} | GT |pred | per-task metrics")
     print("-" * 96)
-    inspect_sample(tasks, pools, args.top_k)
+    inspect_sample(
+        tasks, pools, args.top_k,
+        retrieval=retrieval, embedder=embedder, hybrid_alpha=args.hybrid_alpha,
+    )
     evaluate(tasks, pools, args.top_k,
              llm_config_path=args.llm_config, concurrency=args.concurrency,
-             rerank_mode=args.rerank_mode, candidate_k=args.candidate_k)
+             rerank_mode=args.rerank_mode, candidate_k=args.candidate_k,
+             retrieval=retrieval, embedder=embedder, hybrid_alpha=args.hybrid_alpha)
 
     # Meta-Tool 离线指标:仿真(本地可跑)+ 运行日志聚合(服务端 evaluate 产物)
     if args.meta_sim:
@@ -851,6 +945,7 @@ def main() -> None:
             search_top_k=args.meta_sim_top_k,
             min_score=args.meta_sim_min_score,
             max_searches=args.meta_sim_max_searches,
+            retrieval=retrieval, embedder=embedder, hybrid_alpha=args.hybrid_alpha,
         )
     if args.analyze_meta_runs:
         analyze_meta_tool_runs(args.analyze_meta_runs, tasks=tasks)

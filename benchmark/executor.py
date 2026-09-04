@@ -155,7 +155,8 @@ class BenchmarkExecutor:
             self._initialize_planner_llm(planner_llm_config)
             self.orchestrator_kwargs["planner_llm_client"] = self.planner_llm_client
 
-        # Same for an optional router LLM (used by react_router for LLM routing).
+        # Same for an optional router LLM (generic tool-routing orchestrators;
+        # no current orchestrator passes it — kept for future router-based flows).
         if "router_llm_config" in self.orchestrator_kwargs:
             router_llm_config = self.orchestrator_kwargs.pop("router_llm_config")
             self._initialize_router_llm(router_llm_config)

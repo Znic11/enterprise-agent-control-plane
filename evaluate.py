@@ -36,14 +36,12 @@ from utils.task_queue_worker import TaskQueueWorker
 from orchestrators.react import ReactOrchestrator
 from orchestrators.planner_react import PlannerReactOrchestrator
 from orchestrators.decomposing_planner import DecomposingPlannerOrchestrator
-from orchestrators.react_router import ReactRouterOrchestrator
 from orchestrators.meta_tool_router import MetaToolOrchestrator
 
 ORCHESTRATOR_MAP = {
     "react": ReactOrchestrator,
     "planner_react": PlannerReactOrchestrator,
     "decomposing": DecomposingPlannerOrchestrator,
-    "react_router": ReactRouterOrchestrator,
     "meta_tool": MetaToolOrchestrator,
 }
 
@@ -193,8 +191,9 @@ def load_config(config_path: str = "config.json") -> BenchmarkConfig:
 async def execute_sample(
     config_file, llm_config, output_folder,
     orchestrator="react", planner_llm_config=None, max_num_attempts=5,
-    router_top_k=20, router_llm_config=None,
     meta_tool_top_k=6, meta_tool_min_score=0.03, meta_warmup_top_k=None,
+    retrieval="hybrid", embedding_model=None, embedding_device=None,
+    hybrid_alpha=0.5,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -215,17 +214,18 @@ async def execute_sample(
         orchestrator_kwargs["planner_llm_config"] = random.choice(
             load_llm_configs(planner_llm_config)
         )
-    if orchestrator == "react_router":
-        orchestrator_kwargs["router_top_k"] = router_top_k
-        if router_llm_config is not None:
-            orchestrator_kwargs["router_llm_config"] = random.choice(
-                load_llm_configs(router_llm_config)
-            )
     if orchestrator == "meta_tool":
         orchestrator_kwargs["tool_search_top_k"] = meta_tool_top_k
         orchestrator_kwargs["tool_search_min_score"] = meta_tool_min_score
         if meta_warmup_top_k is not None:
             orchestrator_kwargs["warmup_top_k"] = meta_warmup_top_k
+        # 检索后端:evaluate 端到端默认 hybrid(稠密+稀疏融合);embedding_model
+        # 缺省由 meta_tool_router 用 dense_retriever.DEFAULT_EMBEDDING_MODEL。
+        orchestrator_kwargs["retrieval"] = retrieval
+        if embedding_model is not None:
+            orchestrator_kwargs["embedding_model"] = embedding_model
+        orchestrator_kwargs["embedding_device"] = embedding_device
+        orchestrator_kwargs["hybrid_alpha"] = hybrid_alpha
 
     executor = BenchmarkExecutor(
         config,
@@ -281,7 +281,7 @@ async def main():
         "--orchestrator",
         type=str,
         default="react",
-        choices=["react", "planner_react", "decomposing", "react_router", "meta_tool"],
+        choices=["react", "planner_react", "decomposing", "meta_tool"],
         help="Orchestration strategy.",
     )
     parser.add_argument(
@@ -290,18 +290,36 @@ async def main():
         default=None,
         help="Path to LLM config for the planner (required for planner_react and decomposing).",
     )
+    # ---- meta_tool:工具检索后端(稠密向量检索替换 TF-IDF,参考 Spring AI Alibaba)----
     parser.add_argument(
-        "--router_top_k",
-        type=int,
-        default=20,
-        help="Max tools exposed by the tool router (react_router only).",
+        "--retrieval",
+        type=str,
+        default="hybrid",
+        choices=["tfidf", "dense", "hybrid"],
+        help="Tool retrieval backend for _tool_search (meta_tool only). "
+             "hybrid = dense embedding + sparse TF-IDF weighted fusion (default); "
+             "dense = pure embedding cosine; tfidf = legacy sparse (no extra deps). "
+             "dense/hybrid need the optional 'dense' extra: pip install '.[dense]'.",
     )
     parser.add_argument(
-        "--router_llm_config",
+        "--embedding_model",
         type=str,
         default=None,
-        help="Path to LLM config for the tool router (react_router only; "
-             "defaults to free keyword routing when omitted).",
+        help="Local embedding model for dense/hybrid retrieval (meta_tool only). "
+             "Default: BAAI/bge-small-en-v1.5 (English, ~90MB).",
+    )
+    parser.add_argument(
+        "--embedding_device",
+        type=str,
+        default=None,
+        help="Device for the embedding model: cuda / cpu (default: auto).",
+    )
+    parser.add_argument(
+        "--hybrid_alpha",
+        type=float,
+        default=0.5,
+        help="Dense weight in hybrid fusion (sparse weight = 1 - alpha). "
+             "Higher = more semantic, lower = more lexical (meta_tool only).",
     )
     parser.add_argument(
         "--meta_tool_top_k",
@@ -313,7 +331,7 @@ async def main():
         "--meta_tool_min_score",
         type=float,
         default=0.03,
-        help="TF-IDF floor for _tool_search hits; below counts as zero-hit "
+        help="Retrieval score floor for _tool_search hits; below counts as zero-hit "
              "(meta_tool only).",
     )
     parser.add_argument(
@@ -374,11 +392,13 @@ async def main():
                 cfg, args.llm_config, output_folder,
                 orchestrator=args.orchestrator,
                 planner_llm_config=args.planner_llm_config,
-                router_top_k=args.router_top_k,
-                router_llm_config=args.router_llm_config,
                 meta_tool_top_k=args.meta_tool_top_k,
                 meta_tool_min_score=args.meta_tool_min_score,
                 meta_warmup_top_k=args.meta_warmup_top_k,
+                retrieval=args.retrieval,
+                embedding_model=args.embedding_model,
+                embedding_device=args.embedding_device,
+                hybrid_alpha=args.hybrid_alpha,
             ),
             concurrency=int(args.concurrency),
         )

@@ -3,15 +3,15 @@
 参考 Spring AI Alibaba 的元工具设计(OpenAI tool search / Anthropic tool
 search 同思路):系统只向执行 LLM 暴露一个只读的 ``_tool_search`` 元工具,
 LLM 需要更多业务工具时**显式调用**它(传入描述所需功能的关键词),系统拦截
-这次调用,用 ``benchmark.tool_router.ToolRouter.search``(TF-IDF,复用
-Phase-1 唯一路由实现,零新检索代码)在全工具池检索,把命中的真实工具 schema
+这次调用,用 ``benchmark.tool_router.ToolRouter.search`` 检索(后端可插拔:
+hybrid = 稠密向量 + 稀疏 TF-IDF 融合,默认主通道;dense/tfidf 可切,见
+benchmark/dense_retriever.py)在全工具池检索,把命中的真实工具 schema
 **动态注入(bind)** 进后续轮次的可调用集 —— LLM 在下一轮"看到"这些真实工具
 后自行选择并正式调用;真实调用仍走 ``base._execute_tool_call``。
 
-与 react_router(Phase-1:事前路由 top-k 子集 + 执行期意图级发现 A/B/C)
-并行存在,供同模型同 split 的端到端对照:
-  react_router     —— 系统事前/事后兜底,把工具集"喂"给模型
-  meta_tool_router —— 把"何时检索、搜什么"完全交给 LLM 显式决策(元工具)
+历史:react_router(事前路由 top-k + 执行期意图级发现)对照实现已于 2026-09-04
+移除 —— 用户判定其把问题复杂化;meta_tool_router 的"何时检索、搜什么"完全
+交给 LLM 显式决策(元工具)为主通道,端到端对照基线 = react(oracle mode)。
 
 注入机制(已与用户对齐):**bind 动态扩 + [system] 文本说明,对 LLMClient
 零改动** —— ``llm_client.invoke_with_tools`` 每轮重新 bind 传入的 tools,
@@ -28,7 +28,7 @@ orchestrator 只要每轮传 ``[_tool_search] + 已注入工具 defs``,真实工
 运行(见 evaluate.py CLI):
     python evaluate.py --orchestrator meta_tool --llm_config conf/llm/<m>.json \
         --configs_folder <tasks> --output_folder results/meta_tool/<model> \
-        --num_runs 1
+        --retrieval hybrid --num_runs 1
 """
 
 import json
@@ -38,19 +38,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from benchmark.dense_retriever import DEFAULT_EMBEDDING_MODEL, get_embedder
 from benchmark.llm_client import LLMClient, get_text_content
 from benchmark.models import BenchmarkConfig
-from benchmark.tool_router import ToolRouter
+from benchmark.tool_router import DEFAULT_HYBRID_ALPHA, ToolRouter
 
 from .base import AgentOrchestrator
 
 logger = logging.getLogger(__name__)
 
 TOOL_SEARCH_NAME = "_tool_search"
-DEFAULT_SEARCH_TOP_K = 6        # 与 react_router 意图级检索 intent_top_k 一致
-DEFAULT_SEARCH_MIN_SCORE = 0.03  # 与 react_router intent_min_score 一致(拍脑袋初值,未调参)
+DEFAULT_SEARCH_TOP_K = 6        # 每次 _tool_search 检索返回工具数(沿用历史初值)
+DEFAULT_SEARCH_MIN_SCORE = 0.03  # 检索分数下限(拍脑袋初值,未调参)
 DEFAULT_CACHE_SIZE = 64         # 同会话 query->hits 缓存上限
 DEFAULT_ZERO_HIT_FALLBACK = 3   # 连续零命中达此值 -> 兜底绑定全池,防死锁(None=关闭兜底)
+DEFAULT_RETRIEVAL = "tfidf"     # 检索后端默认 tfidf(纯 stdlib 保单测/离线一致);
+                                # evaluate.py 端到端 CLI 默认 hybrid(evaluate 边界显式指定)
 
 
 def build_tool_search_def() -> Dict[str, Any]:
@@ -97,7 +100,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
 
     Args:
         tool_search_top_k:        每次 _tool_search 最多检索并返回多少工具。
-        tool_search_min_score:    TF-IDF 分数下限(低于视为零命中)。
+        tool_search_min_score:    检索分数下限(低于视为零命中)。
         cache_size:               同会话 query->hits 缓存条目上限(不跨任务)。
         boost_lookup:              检索时对 find_/list_/get_ 前缀工具加 LOOKUP_FLOOR
                                    地板分(与 route() 的只读启发式一致)。
@@ -106,6 +109,15 @@ class MetaToolOrchestrator(AgentOrchestrator):
         warmup_top_k:             预热模式:首轮就把 route(user_prompt) 粗筛出的
                                    top-k 工具一并注入(与 _tool_search 并存)。
                                    None = 纯 Meta-Tool 单通道(默认,先验证假设)。
+        retrieval:                检索后端 "tfidf"(默认,纯 stdlib)/ "dense" /
+                                   "hybrid"。稠密通道见 benchmark/dense_retriever;
+                                   evaluate.py 端到端 CLI 默认 hybrid。
+        embedding_model:          retrieval != "tfidf" 时的本地 embedding 模型
+                                   (默认 BAAI/bge-small-en-v1.5,见 dense_retriever)。
+        embedding_device:         "cuda"/"cpu"/None(auto;默认 None)。
+        embedder:                 (测试/调用方注入用)已构造好的 TextEmbedder;
+                                  为 None 时由 get_embedder(embedding_model) 提供。
+        hybrid_alpha:             hybrid 融合的稠密权重(稀疏权重 = 1-alpha)。
     """
 
     def __init__(
@@ -122,6 +134,11 @@ class MetaToolOrchestrator(AgentOrchestrator):
         boost_lookup: bool = False,
         fallback_all_after_zero_hits: Optional[int] = DEFAULT_ZERO_HIT_FALLBACK,
         warmup_top_k: Optional[int] = None,
+        retrieval: str = DEFAULT_RETRIEVAL,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_device: Optional[str] = None,
+        embedder: Any = None,
+        hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -142,9 +159,32 @@ class MetaToolOrchestrator(AgentOrchestrator):
         self.tool_search_min_score = tool_search_min_score
         self.boost_lookup = boost_lookup
         self.fallback_all_after_zero_hits = fallback_all_after_zero_hits
+        self.retrieval = retrieval
+        self.hybrid_alpha = hybrid_alpha
+
+        # 检索后端:默认 tfidf(纯 stdlib);dense/hybrid 时优先用注入的 embedder
+        # (单测/调用方提供),否则经 get_embedder 拿模块级单例(每进程加载一次)。
+        embedder_ = embedder
+        if retrieval != "tfidf" and embedder_ is None and available_tools:
+            embedder_ = get_embedder(embedding_model, embedding_device)
+        if retrieval != "tfidf":
+            logger.info(
+                f"[META-TOOL] retrieval={retrieval} "
+                f"embedder={'injected' if embedder is not None else embedding_model} "
+                f"(device={embedding_device or 'auto'}) hybrid_alpha={hybrid_alpha}"
+            )
 
         # 全池索引与 name -> def 映射(检索与执行共用)
-        self._router = ToolRouter(available_tools) if available_tools else None
+        self._router = (
+            ToolRouter(
+                available_tools,
+                retrieval=retrieval,
+                embedder=embedder_,
+                hybrid_alpha=hybrid_alpha,
+            )
+            if available_tools
+            else None
+        )
         self._all_tools_by_name = {str(t["name"]): t for t in available_tools}
 
         # 状态:注入集合(保序)、query->hits 缓存、计数
@@ -347,6 +387,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
         """
         return {
             "meta_tool": True,
+            "meta_tool_retrieval": self.retrieval,
+            "meta_tool_hybrid_alpha": self.hybrid_alpha,
             "meta_tool_search_calls": self.search_calls,
             "meta_tool_searches": self.searches,
             "meta_tool_cache_hits": self.cache_hits,

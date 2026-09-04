@@ -41,8 +41,14 @@ deepseek = [
 qwq = [
     "langchain-qwq>=0.1.0",
 ]
+# 稠密向量检索(meta_tool 检索后端 dense/hybrid 需要;torch 建议 CPU 版即可)
+# 安装: pip install '.[dense]'   或   uv sync --extra dense
+dense = [
+    "sentence-transformers>=2.7.0",
+    "torch>=2.0.0",
+]
 all = [
-    "EnterpriseOps-Gym[anthropic,openai,google,deepseek,qwq]",
+    "EnterpriseOps-Gym[anthropic,openai,google,deepseek,qwq,dense]",
 ]
 
 [dependency-groups]
