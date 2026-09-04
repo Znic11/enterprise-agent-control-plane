@@ -207,7 +207,15 @@
 ### 4.6.4 服务端可复现命令(hybrid 真模型)
 ```bash
 # 服务器(有网络/磁盘;首次拉 bge 建议 HF_ENDPOINT=https://hf-mirror.com)
-pip install -e '.[dense]'                      # 或 uv sync --extra dense
+# ⚠️ 安装方式:本项目是"非包"工具仓库(pyproject [tool.uv] package=false)——
+#   标准做法是只装依赖、不装项目自身;`pip install -e '.[dense]'` 不是必需。
+uv sync --extra dense                        # 推荐(uv;只装依赖含 dense extra)
+# 或 pip 直装依赖(无需 -e):
+pip install 'sentence-transformers>=2.7.0' 'torch>=2.0.0'
+# 或坚持 `pip install -e '.[dense]'` 也可以:pyproject 已于 09-04 显式声明
+# [build-system] + [tool.setuptools.packages.find] include=benchmark*/orchestrators*/utils*,
+# 不再触发 flat-layout 自动发现报错;若仍报 "Multiple top-level packages",先删除仓库
+# 根目录的误建垃圾文件(常见: ls / list 等无扩展名文件),再重试。
 
 # ① 离线仿真对齐(tfidf 旧口径 vs hybrid 新口径,零 LLM 成本)
 python eval_router.py --tools tools_dump.json --retrieval hybrid \

@@ -22,8 +22,10 @@
   benchmark/dense_retriever.py(TextEmbedder 抽象 + SentenceTransformerEmbedder + DenseIndex + get_embedder 缓存)
 - react_router 已于 09-04 彻底删除;ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool
 - ⚠️ 运行环境:必须用项目 .\.venv\Scripts\python.exe(Python 3.14.3,含 langchain_core);本地无 conf/llm(key)
-  与容器 → 端到端需服务端(RUN_GUIDE.md);numpy 需 ≥2.3(cp314),装法见 HANDOFF §2;dense/hybrid 需
-  pip install '.[dense]'(sentence-transformers+torch,建议清华镜像 + HF_ENDPOINT=https://hf-mirror.com)
+  与容器 → 端到端需服务端(RUN_GUIDE.md);numpy 需 ≥2.3(cp314),装法见 HANDOFF §2;dense/hybrid 依赖用
+  `uv sync --extra dense` 装(项目是非包仓库 [tool.uv] package=false,勿 `pip install -e '.[dense]'`;
+  若坚持 -e,pyproject 已加 setuptools 包发现配置可正常构建);sentence-transformers/torch 建议清华镜像
+  + HF_ENDPOINT=https://hf-mirror.com;服务端若报 "Multiple top-level packages",先删仓库根 ls/list 垃圾文件
 
 【已完成(截至 09-04,commit 链 6c308bb ← 67714f6 ← 7edee85 ← 2c2b62f ← 9a04a3d …)】
 - 执行循环鲁棒化 + 意图级检索(9a04a3d/2c2b62f,历史;react_router 已删,其 B 异常兜底被 meta_tool 继承)
@@ -39,7 +41,8 @@
 【本次会话的核心任务(按 ROI,与用户对齐再动)】
 1. 【P0,最大空白】服务端 hybrid 端到端对照:evaluate.py --orchestrator meta_tool --retrieval hybrid
    (同 split 对比用户已跑的 tfidf 版 32.35%);跑完 eval_router.py --analyze_meta_runs 聚合。命令见
-   HANDOFF §4.6.4(先 pip install -e '.[dense]',bge 首次下载设 HF_ENDPOINT=https://hf-mirror.com)
+   HANDOFF §4.6.4(先 `uv sync --extra dense` 或 pip 直装 sentence-transformers/torch,
+   bge 首次下载设 HF_ENDPOINT=https://hf-mirror.com)
 2. 【P1】服务端离线参数扫描(零 LLM 成本):eval_router.py --meta_sim 扫 retrieval ∈ {tfidf,dense,hybrid}
    × alpha ∈ {0.3,0.5,0.7},产出 recall/precision 对照表做调参依据与面试消融
 3. 【P1】README / 作品集(enterprise-agent-control-plane)如实回填:hybrid 检索 + 55/55 + e2e 小样本数字

@@ -60,3 +60,16 @@ dev = [
 
 [tool.uv]
 package = false
+
+# ---- 打包配置(仅对 `pip install -e .` / `uv pip install -e '.[x]'` 生效)----
+# 项目本质是"非包"工具仓库([tool.uv] package=false,标准流程 uv sync 只装依赖);
+# 但用户可能习惯性执行 `pip install -e .`,此时 setuptools flat-layout 自动发现会把
+# conf/data/logs/assets/results/orchestrators 等顶层目录(乃至误建的 ls/list 垃圾文件)
+# 全部当成候选包 → "Multiple top-level packages discovered" 构建失败。
+# 因此显式声明包发现范围,只纳入真正作为包 import 的目录。
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["benchmark*", "orchestrators*", "utils*"]
