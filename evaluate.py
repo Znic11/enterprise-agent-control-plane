@@ -383,6 +383,16 @@ async def main():
         configs_folder = args.configs_folder
 
     config_files = glob.glob(os.path.join(configs_folder, "*.json"))
+    if not config_files:
+        # 空跑是最难 debug 的失败:建了 run 目录、日志说 0 files,但进程正常退出。
+        # 给出可操作提示而不是静默结束。
+        raise SystemExit(
+            f"[evaluate] configs_folder 中没有 *.json 任务配置: {configs_folder!r}\n"
+            "  可能原因:① 路径不存在或为空;② 任务文件被放在子目录里"
+            "(glob 只扫 configs_folder 顶层,不递归);③ runtmp 是临时目录已被清理。\n"
+            "  解决:ls/find 确认文件位置后指向正确目录;或改用 --hf_dataset "
+            "--domain <域> --mode oracle 让 evaluate 自动下载并生成配置。"
+        )
     for idx in range(int(args.num_runs)):
         output_folder = os.path.join(args.output_folder, f"run_{idx+1}")
         os.makedirs(output_folder, exist_ok=True)
