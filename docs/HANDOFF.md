@@ -93,7 +93,7 @@
 - 与旧 `_discover_if_needed` 关系:保留(便宜,精确命中直接执行);意图级检索负责"模型无法点名"的补盲。
 
 ### 4.4 测试与验证状态
-- 全量 **51/51 通过**(意图级检索相关 40 例 + Meta-Tool 11 例,§4.5.5):触发点 A/B/C 各场景、正常收尾不误触、幻觉名零命中不致命、关闭 discovery 退化不炸、**安全"只加不执行"实证(mcp.calls==[])**、search API 排序/top_k/min_score/boost_lookup 一致性、便捷函数与实例同源;Meta-Tool 闭环/兜底/缓存/并行/预热见 §4.5.5。
+- 全量 **51/51 通过**(意图级检索相关 40 例 + Meta-Tool 11 例,§4.5.5;09-04 新增 dense 套件后扩至 **55/55**,见 §4.6):触发点 A/B/C 各场景、正常收尾不误触、幻觉名零命中不致命、关闭 discovery 退化不炸、**安全"只加不执行"实证(mcp.calls==[])**、search API 排序/top_k/min_score/boost_lookup 一致性、便捷函数与实例同源;Meta-Tool 闭环/兜底/缓存/并行/预热见 §4.5.5。
 - 无 LLM key/容器 → **对任务成功率的端到端增益仍未量化**(最大验证空白,服务端可跑)。
 
 ---
@@ -152,7 +152,7 @@
 - `evaluate.py`:`ORCHESTRATOR_MAP["meta_tool"] = MetaToolOrchestrator`;CLI `--meta_tool_top_k`(默认 6)/`--meta_tool_min_score`(默认 0.03)/`--meta_warmup_top_k`(默认 None)。
 - `eval_router.py`:`simulate_meta_tool()`(任务文本切段模拟逐轮 `_tool_search`,统计 final_recall/first_recall/hits_avg/zero%/full_cov/precision)+ `analyze_meta_tool_runs()`(聚合 evaluate.py `results_*.json` 的 run 级 `meta_tool_*`);CLI `--meta_sim`/`--meta_sim_top_k`/`--meta_sim_min_score`/`--meta_sim_max_searches`/`--analyze_meta_runs`。
 - `benchmark/tool_router.py`(+5):`build_tool_signature` 对 `inputSchema`/`input_schema` 双兼容(小写优先、驼峰 fallback)。
-- `tests/test_meta_tool_router.py`(新,11 例,全量 51/51 通过)。
+- `tests/test_meta_tool_router.py`(新,11 例,当时全量 51/51 通过;09-04 dense 套件加入后全量 55/55)。
 
 **§4.5.4 九个问题 → 落地口径**:
 
