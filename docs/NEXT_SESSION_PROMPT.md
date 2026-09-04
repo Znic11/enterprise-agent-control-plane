@@ -27,7 +27,7 @@
   若坚持 -e,pyproject 已加 setuptools 包发现配置可正常构建);sentence-transformers/torch 建议清华镜像
   + HF_ENDPOINT=https://hf-mirror.com;服务端若报 "Multiple top-level packages",先删仓库根 ls/list 垃圾文件
 
-【已完成(截至 09-04,commit 链 6c308bb ← 67714f6 ← 7edee85 ← 2c2b62f ← 9a04a3d …)】
+【已完成(截至 09-04,HEAD = 086bcea;链:086bcea ← f8820d5 ← 25068d1 ← 01acad1 ← 6c308bb ← …)】
 - 执行循环鲁棒化 + 意图级检索(9a04a3d/2c2b62f,历史;react_router 已删,其 B 异常兜底被 meta_tool 继承)
 - MetaToolOrchestrator(7edee85):_tool_search 显式检索 → schema 注入 → 真实执行;零命中回喂引导、连续
   3 次兜底 bind 全池;query→hits LRU(64);warmup_top_k 预热(默认 None=纯单通道);九个设计问题定调见
@@ -36,13 +36,18 @@
   用户决策移除 react_router + 换稠密检索;evaluate.py --retrieval(默认 hybrid)/eval_router.py resolve_retrieval
   (auto 无依赖回退 tfidf);pyproject [dense] extra;单测 55/55(test_tool_router 33 + meta_tool 11 +
   dense 11,FakeEmbedder 确定性);离线 tfidf 冒烟 ALL recall@20 42.5% 零回归
-- docs/HANDOFF.md(09-04 版)、tool_router_design.md §7.3 已回填;tests/ 在 .git/info/exclude(不入库)
+- **服务端真池 hybrid 数字已出**(tools_dump,csm=89/itsm=93):meta_sim final_recall 31.9% vs tfidf 27.5%、
+  hits_avg 1.70 vs 1.20、**zero% 6%→0**;粗筛 route 38.8% 略逊 tfidf 42.5%(非主通道,见 HANDOFF §4.6.3)。
+  ⚠️ `--analyze_meta_runs` 必须单独用或配合 --meta_sim 用(f8820d5 已修短路,否则会先误跑近似池)
+- 三个运维 hotfix:25068d1(pyproject setuptools 包发现,修 pip install -e)/f8820d5(analyze 短路 + ST
+  维度查询兼容)/086bcea(补 nest_asyncio/aiohttp 依赖声明,uv sync 只装声明依赖!)
+- docs/HANDOFF.md(09-04 版,含服务端数字)、tool_router_design.md §7.3 已回填;tests/ 在 .git/info/exclude(不入库)
 
 【本次会话的核心任务(按 ROI,与用户对齐再动)】
 1. 【P0,最大空白】服务端 hybrid 端到端对照:evaluate.py --orchestrator meta_tool --retrieval hybrid
-   (同 split 对比用户已跑的 tfidf 版 32.35%);跑完 eval_router.py --analyze_meta_runs 聚合。命令见
-   HANDOFF §4.6.4(先 `uv sync --extra dense` 或 pip 直装 sentence-transformers/torch,
-   bge 首次下载设 HF_ENDPOINT=https://hf-mirror.com)
+   (同 split 对比用户已跑的 tfidf 版 32.35%);跑完 eval_router.py --analyze_meta_runs out/meta_hybrid
+   聚合(已短路,直接出 run 级 meta_tool_* 表)。命令见 HANDOFF §4.6.4
+   (依赖装齐后无需再动;bge 首次下载设 HF_ENDPOINT=https://hf-mirror.com)
 2. 【P1】服务端离线参数扫描(零 LLM 成本):eval_router.py --meta_sim 扫 retrieval ∈ {tfidf,dense,hybrid}
    × alpha ∈ {0.3,0.5,0.7},产出 recall/precision 对照表做调参依据与面试消融
 3. 【P1】README / 作品集(enterprise-agent-control-plane)如实回填:hybrid 检索 + 55/55 + e2e 小样本数字

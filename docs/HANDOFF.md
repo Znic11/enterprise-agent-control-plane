@@ -10,7 +10,7 @@
 
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研"企业级 LLM Agent",核心卖点 = 用**检索+LLM 的工具路由逼近 oracle 模式**(把"答案泄露"变成"能力预测"),以可复现实验证明有效性,作为面试核心项目;代码同步沉淀在 GitHub 作品集 `enterprise-agent-control-plane`(= 本仓库 origin)。
 2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);单测 **55/55 通过**(§2),提交状态见 §3.3/§4.6。
-3. **端到端价值验证是最大空白**:用户已完成首轮小样本端到端(meta_tool 32.35% vs react-oracle 30.39%,非显著),但 **hybrid 检索后端在服务端的端到端对照尚未跑**(本地只做了确定性 FakeEmbedder 单测与 tfidf 零回归冒烟)。**待办**:服务端 `.[dense]` 真模型跑 hybrid 离线仿真 + 端到端对照、`--retrieval` 调参、README 如实回填(§6)。
+3. **hybrid 端到端增益是当前最大空白(推进中)**:用户首轮小样本端到端 meta_tool 32.35% vs react-oracle 30.39%(非显著);**hybrid 真池离线数字已由服务端跑出**(§4.6.3:meta_sim final_recall 31.9% vs tfidf 27.5%、zero% 6%→0),**端到端 evaluate.py hybrid 正在服务端执行**,results_*.json 到手后 `eval_router.py --analyze_meta_runs`(已修复为短路纯聚合)即可回填。**待办**:e2e 数字回填 → alpha 扫描 → README 如实呈现(§6)。
 
 ---
 
@@ -56,7 +56,7 @@
 - full_cov 坑:32/160 GT 引用其他域容器工具(不可达),须按 reachable 口径排除(999c15d),否则 full_cov=0 误报。
 
 ### 3.3 相关 commit 链(main,新→旧)
-`6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
+`086bcea`(fix(deps): 补声明 nest_asyncio/aiohttp,evaluate 运行时依赖缺口) ← `f8820d5`(fix(eval): --analyze_meta_runs 短路纯聚合 + ST 维度查询 FutureWarning 兼容) ← `25068d1`(fix(packaging): 显式 setuptools 包发现,修 pip install -e flat-layout 报错) ← `6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit 01acad1) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
 
 ---
 
@@ -202,7 +202,11 @@
 - 全量 **55/55**(test_tool_router 33 + test_meta_tool_router 11 + **test_dense_retriever 11 新**);dense 套件用 **FakeEmbedder/ConceptEmbedder**(8 维概念簇确定性模拟语义,词面零重叠 query → 稠密命中),不依赖真实 torch/ST —— 覆盖:L2 归一/余弦 top-k、纯 tfidf 零词法对照空、dense 命中语义匹配、min_score/boost_lookup、构造校验、**alpha=0 退化稀疏 / alpha=1 等于纯 dense**、route() 元数据、MetaToolOrchestrator hybrid 闭环注入(注入可见集→模型显式调用→mcp.calls 断言)。
 - 本地环境 numpy 曾缺失/损坏(3.14 需 ≥2.3;中断装出缺 `__init__.py` 的假 numpy)→ 已 `rm -rf` + 清华镜像重装 **numpy 2.5.2**,dense 测试真跑通过。
 - **离线 tfidf 冒烟零回归**:`eval_router.py --tools tools_dump.json` → ALL recall@20 **42.5%**(与重构前一致)。
-- ⚠️ 真实稠密模型(bge)在本机未装 sentence-transformers → **hybrid 的真实数字需服务端验证**(命令见 §4.6.4)。
+- **服务端真池 hybrid 数字已出**(tools_dump 真池 csm=89/itsm=93,13 任务,bge-small-en-v1.5 CPU):
+  - **meta_sim(主通道诊断,vs tfidf)**:final_recall **31.9% vs 27.5%**(+4.4pp)/ first_recall **11.9% vs 6.9%** / hits_avg **1.70 vs 1.20** / **zero% 0.0% vs 6.0%(零命中归零,meta_tool 兜底主因消除)** / precision 22.4% vs 20.5% → hybrid 在主通道全面变好。
+  - **粗筛 route(非主通道,meta_tool 默认 warmup=None 不用它)**:ALL recall@20 **38.8% vs tfidf 42.5%**(略降)——整条长任务文本单 query 场景下稠密平均化摊平词法尖峰、`find_*` 查找族被 add_/update_ 同族挤出;若将来启用 warmup_top_k 走 route,可考虑保留 tfidf 后端(见 §5 #3)。
+  - ⚠️ 诚实口径:meta_sim 仿真 query 是任务文本自动切段,非 LLM 生成 → 是检索器覆盖**下界/诊断**,端到端增益仍需 evaluate.py(用户已在服务端跑 hybrid,数字待回填 §4.6.4 之后)。
+  - 教训:`eval_router.py --analyze_meta_runs` **旧实现不短路**,会先按默认 data/revised 近似池(csm=44)跑一份完整粗筛——近似池 desc 伪造、recall 虚高(曾跑出 60.6%),易被误读为真池结论。已修(`f8820d5`):analyze-only 短路纯聚合,不建池/不加载 bge。
 
 ### 4.6.4 服务端可复现命令(hybrid 真模型)
 ```bash
@@ -236,13 +240,13 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
 
-1. **【已落地】工具调用主通道 = Meta-Tool + Hybrid 检索**:`MetaToolOrchestrator` 已注册,`_tool_search` 走 `retrieval=hybrid`(稠密 bge + 稀疏 TF-IDF,alpha=0.5);react_router 已移除(§4.6)。剩余 = **hybrid 端到端增益量化(服务端)** 与 `_tool_search` 参数调优。
+1. **【已落地】工具调用主通道 = Meta-Tool + Hybrid 检索**:`MetaToolOrchestrator` 已注册,`_tool_search` 走 `retrieval=hybrid`(稠密 bge + 稀疏 TF-IDF,alpha=0.5);react_router 已移除(§4.6)。真池离线 meta_sim 已量化(31.9% vs tfidf 27.5%,zero% 归零);剩余 = **evaluate.py hybrid 端到端数字回填** 与 `_tool_search` 参数调优。
 2. **【待决策】LOOKUP_FLOOR 默认值**:0.08 → 0.15?(真实池扫描 0.15 显著提 recall;暴露数 20→30)。Meta-Tool 的 `boost_lookup` 默认 False(是否默认开待数据)。
-3. **【待调参】hybrid 参数族**:`hybrid_alpha=0.5`、`BAAI/bge-small-en-v1.5`、dense 通道 min-max 归一都是首版拍板 —— 服务端可先用 `eval_router.py --meta_sim` 扫 alpha∈{0.3,0.5,0.7} 与 tfidf vs dense vs hybrid 的 recall 差,再端到端验证 LLM 触发率/误触发率。
+3. **【待调参】hybrid 参数族 + 粗筛路径观察**:服务端真池显示 route 粗筛 hybrid(38.8%)略逊 tfidf(42.5%),而 meta_sim(主通道)全面占优 → 若将来启用 `warmup_top_k`(route 预热)建议 route 用 tfidf、`_tool_search` 用 hybrid,或降低 alpha;可先用 `eval_router.py --meta_sim` 扫 alpha∈{0.3,0.5,0.7}。
 4. **【初值未调,已有默认+仿真诊断】** `_tool_search` top_k=6/min_score=0.03/缓存 64/零命中兜底 3;`--meta_sim` 已能离线诊断检索器覆盖。
-5. **【已知行为】** `_tool_search` 零词法+低语义(如幻觉名)→ 零命中 → 回喂引导不中断;连续 3 次零命中兜底 bind 全池防死锁。
+5. **【已知行为】** `_tool_search` 零词法+低语义(如幻觉名)→ 零命中 → 回喂引导不中断;连续 3 次零命中兜底 bind 全池防死锁(hybrid 下 zero% 已归零,兜底预计很少触发)。
 6. **【潜在 bug,已单测覆盖】** LLM 一次发多个 tool_call 的并行处理、注入说明插入位置 —— 单测已覆盖;`tool_call_id` 真实端到端匹配与 hybrid 下 bge 编码耗时仍需服务端验证。
-7. **【环境坑】** 服务器 sentence-transformers + torch 安装体积大,注意磁盘;bge 首次下载走 HF,必要时设 `HF_ENDPOINT=https://hf-mirror.com`;Python 3.14 需 numpy≥2.3(cp314)。
+7. **【环境坑】** 服务器 sentence-transformers + torch 安装体积大;bge 首次下载设 `HF_ENDPOINT=https://hf-mirror.com`;Python 3.14 需 numpy≥2.3(cp314)。**依赖只信 pyproject**:uv sync 只装声明的依赖,老环境手工装过的包(nest_asyncio/aiohttp 等)在新装环境会缺 → 已补声明(`086bcea`);再遇 ModuleNotFoundError 照提示补装并把包名回报。
 
 ---
 
@@ -250,7 +254,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 
 | # | 任务 | 前置 | 状态/价值 |
 |---|---|---|---|
-| 1 | **【P0】服务端 hybrid 端到端对照**:meta_tool + hybrid(§4.6.4 命令)vs 用户已跑的 tfidf 版(32.35%)同 split 对比;跑完 `--analyze_meta_runs` 聚合 run 级 meta_tool_* 指标 | 服务器装 `.[dense]` + bge 模型 | **hybrid 增益量化**(最大空白) |
+| 1 | **【P0】服务端 hybrid 端到端对照**:evaluate.py `--retrieval hybrid` 已具备真池离线佐证(meta_sim 31.9% vs 27.5%);端到端跑动中 —— 出 results_*.json 后 `--analyze_meta_runs out/meta_hybrid`(已短路,直接聚合)回填数字,与用户 tfidf 版(32.35%)同 split 对比 | 服务器(依赖已装齐) | **hybrid 端到端增益量化**(最大空白) |
 | 2 | **【P1】离线参数扫描(服务端,零 LLM 成本)**:`eval_router.py --meta_sim` 扫 retrieval ∈ {tfidf,dense,hybrid} × alpha ∈ {0.3,0.5,0.7} × top_k,产出 recall/precision 对照表 | #1 同一环境 | 调参依据 + 面试消融 |
 | 3 | **【P1】README / 作品集如实回填**:标注 Meta-Tool 主通道 + hybrid 检索后端(机制、alpha、55/55、离线下界数字、e2e 小样本结果 32.35% vs 30.39% 需注明"小样本非显著") | 无 | 面试呈现(防深挖翻车) |
 | 4 | **【P1】`_tool_search` 参数调优**:top_k/min_score/缓存/零命中兜底阈值的触发率与误触发率统计 | #1 数据 | 稳定性 + 延迟 |
@@ -258,7 +262,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 | 6 | **【P2】稠密通道噪声诊断**:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #2 数据 | 误报控制 |
 | 7 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #1 数据 | 即得 recall 增益 |
 
-✅ 已完成(2026-08-31~09-04):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85,51/51);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb,55/55 + tfidf 冒烟零回归)**;tests/test_dense_retriever.py 11 例真跑通过(numpy 2.5.2 修复后)。
+✅ 已完成(2026-08-31~09-04):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85,51/51);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb,55/55 + tfidf 冒烟零回归)**;tests/test_dense_retriever.py 11 例真跑通过(numpy 2.5.2 修复后);服务端真池 hybrid 离线数字已回填 §4.6.3(meta_sim 31.9%);三个运维 hotfix(25068d1 打包 / f8820d5 analyze 短路 / 086bcea 依赖声明)。
 
 长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正 → 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
 
@@ -274,4 +278,4 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 - 记忆:`.workbuddy/memory/2026-09-04.md`(本会话:dense/hybrid 落地 + numpy 坑 + e2e 决策)、09-03(ToolLLM 调研+意图检索落地+TF-IDF 结论)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
 
 ---
-*本文档由 2026-09-04 会话更新(Hybrid 稠密检索落地 + react_router 移除 + 55/55 单测 + e2e 小样本对照记录;commit 6c308bb),供新会话无缝接手。实现状态均已如实标注;服务端 hybrid 端到端验证完成后请回填数字。*
+*本文档由 2026-09-04 会话更新(Hybrid 稠密检索落地 + react_router 移除 + 55/55 单测 + 服务端真池 hybrid 离线数字 + 三个运维 hotfix;HEAD = 086bcea),供新会话无缝接手。实现状态均已如实标注;服务端 hybrid 端到端(results_*.json → --analyze_meta_runs)跑完后请回填数字。*
