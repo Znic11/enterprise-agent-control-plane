@@ -268,13 +268,17 @@ import json, glob
 
 ---
 
-## 7. 执行期补充:意图级检索 + Meta-Tool(元工具)模式(2026-09-03 落地)
+## 7. 执行期补充:意图级检索 + Meta-Tool(元工具)模式 + Hybrid 检索(2026-09-03/09-04 落地)
 
-> ⚠️ 本章补充 Phase-1 之后新增的两层执行期机制。正文 §3/§4 的 BM25 骨架是早期设计稿;
-> **当前唯一实现**是 `benchmark/tool_router.py`(TF-IDF 余弦 + `LOOKUP_FLOOR` 只读启发式,
-> 接口/语义以此为准)。落地详情与 9 个设计问题的定调见 `docs/HANDOFF.md` §4.5。
+> ⚠️ 本章补充 Phase-1 之后新增的执行期机制与检索后端演进。正文 §3/§4 的 BM25 骨架是早期设计稿;
+> **当前唯一实现**是 `benchmark/tool_router.py`(稀疏 TF-IDF 余弦 / 稠密向量 / Hybrid 融合三后端可插拔,
+> 接口/语义以此为准)。落地详情见 `docs/HANDOFF.md` §4.5(09-03 Meta-Tool)与 §4.6(09-04 dense/hybrid + react_router 移除)。
 
-### 7.1 第一层:执行期意图级检索(react_router 触发点 A/B/C,已提交 9a04a3d/2c2b62f)
+### 7.1 第一层(历史,已随 react_router 移除):执行期意图级检索(触发点 A/B/C,已提交 9a04a3d/2c2b62f)
+
+> ⚠️ **2026-09-04 起 `orchestrators/react_router.py` 已删除**(用户判定双轨复杂化、不优雅,评估叙事收敛为
+> meta_tool 主通道)。本节保留作设计历史:触发点 A(unknown_call)与 C(text_gap)在 meta_tool 下已被
+> 显式 `_tool_search` 取代(检索时机完全交给 LLM);**B(exec_error try/except)被 meta_tool 继承保留**。
 
 路由"事前给子集"只能覆盖粗筛已召回的 15–20 个工具。执行中模型会遇到三缺口,由
 `orchestrators/react_router.py` 处理(**命中工具只进可见集,绝不自动执行**):
@@ -289,7 +293,7 @@ import json, glob
 只打分返回 `(score, name)`,入不入活跃集由调用方决定)。安全边界:检索输入只来自模型上下文与调用,
 **绝不读 selected_tools**(执行时读 = 答案泄露)。
 
-### 7.2 第二层:Meta-Tool(元工具)模式(本会话落地,未提交)
+### 7.2 第二层:Meta-Tool(元工具)模式(09-03 落地,7edee85/67714f6 提交;检索后端已 hybrid 化见 §7.3)
 
 参考 Spring AI Alibaba / OpenAI tool search / Anthropic tool search:**系统只暴露一个只读元工具
 `_tool_search`,由 LLM 显式决定"何时检索、搜什么"**,检索命中后把真实工具 schema 动态注入后续
@@ -326,7 +330,37 @@ import json, glob
 
 **评估**:离线仿真 `eval_router.py --meta_sim`(任务文本切段模拟逐轮检索,统计 final_recall /
 first_recall / hits_avg / zero% / full_cov / precision;诚实口径 = 检索器对"分批能力片段"query 的
-覆盖下界,非端到端);端到端 `evaluate.py --orchestrator meta_tool --meta_tool_top_k …`(服务端,
-run 级 `meta_tool_*` 元数据落盘 → `--analyze_meta_runs` 聚合)。对照口径:react_router vs
-meta_tool_router **同模型/同 split/同 concurrency**。
+覆盖下界,非端到端);端到端 `evaluate.py --orchestrator meta_tool --retrieval …`(服务端,
+run 级 `meta_tool_*` 元数据落盘 → `--analyze_meta_runs` 聚合)。09-04 起对照口径不再是
+react_router vs meta_tool_router(react_router 已删),而是 **meta_tool 内部检索后端对照**:
+tfidf vs dense vs hybrid(同模型/同 split/同 concurrency)。
+
+### 7.3 Hybrid 稠密检索后端(2026-09-04 落地,commit 6c308bb;参考 Spring AI Alibaba 工具检索)
+
+**动机**:Meta-Tool 的 `_tool_search` query 是 LLM 自生成的能力描述,与工具名/描述经常"同义不同词"
+(实测零词法重叠漏检约占 1/3)。稀疏 TF-IDF 只认词面重叠 → 换成 **稠密向量语义检索**,并用
+**Hybrid 融合**兼顾语义(同义词)与词面(精确工具名/参数键,稠密对精确 ID 类不敏感)。
+
+```
+q ──► ToolRouter._rank_all(query)                  [retrieval = tfidf|dense|hybrid]
+        ├─ 稀疏通道: TFIDFIndex.search_all  → sparse score(余弦,可能 0.9+ 尖峰)
+        ├─ 稠密通道: DenseIndex.search_all   → dense score(L2 归一余弦,通常 0.2-0.6)
+        └─ hybrid 融合: score = α·minmax01(dense) + (1-α)·sparse
+             min-max 归一到 [0,1] 解决双通道量纲不可比 —— α 才是可解释的语义权重
+```
+
+| 组件 | 说明 |
+|---|---|
+| `benchmark/dense_retriever.py` | `TextEmbedder` 抽象(`embed_texts` 单一接口,`embed_query` 默认派生);`SentenceTransformerEmbedder`(默认 **BAAI/bge-small-en-v1.5**,384 维、CPU 毫秒级;`query_instruction` 默认空串,参数保留调优);`DenseIndex`(工具签名矩阵一次性编码,L2 归一后余弦=点积);`APIEmbedder` 预留(OpenAI 兼容 /embeddings);`get_embedder()` 模块级缓存(同 (model,device) 一次加载,e2e 并发共享) |
+| `ToolRouter(retrieval=...)` | 构造参数 `retrieval=tfidf(default)|dense|hybrid` + `embedder`(可注入,测试用 FakeEmbedder)/`hybrid_alpha=0.5`;校验非法值/缺 embedder;`_rank_all()` 集中融合,`route()/search()/batch_route()/search_tools()` 与旧接口完全一致,仅 `method`/元数据打标 `<retrieval>+llm[+union]` |
+| `meta_tool_router.py` | `_tool_search` 检索后端可配 `retrieval/embedding_model/embedding_device/hybrid_alpha`;运行时元数据 `meta_tool_retrieval`/`meta_tool_hybrid_alpha` 入 execute 结果与审计 |
+| `evaluate.py` / `eval_router.py` | CLI `--retrieval(默认 hybrid)/--embedding_model/--embedding_device/--hybrid_alpha`;离线 `resolve_retrieval`:auto → 有 sentence-transformers 则 hybrid,否则 tfidf(无依赖用户无缝回退) |
+
+**诚实性 / 环境边界**:
+- dense/hybrid 依赖可选 extra `pip install '.[dense]'`(sentence-transformers + torch);缺依赖时
+  **显式 ImportError 带安装提示,绝不静默降级**(实验口径必须真实可复现)。
+- bge 首次下载走 HuggingFace,服务器设 `HF_ENDPOINT=https://hf-mirror.com` 加速。
+- 测试用确定性 `FakeEmbedder/ConceptEmbedder`(概念词表把同义词映射到同方向低维向量)验证
+  语义命中与融合退化(α=0 纯稀疏 / α=1 纯稠密),不依赖真实 torch;55/55 单测通过。
+- 本地验证:hybrid 真实数字需服务端(见 HANDOFF §4.6.4 命令);离线 tfidf 冒烟 ALL recall@20 = 42.5%(零回归)。
 

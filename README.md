@@ -53,9 +53,9 @@ Agent 领域不缺能跑通 toy task 的 demo，缺的是**能部署到真实企
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| 工具路由 `benchmark/tool_router.py` | ✅ 已实现 | TF-IDF 漏斗 + 可选 LLM 精排，路由质量可离线评测 |
-| 离线路由评测 `eval_router.py` | ✅ 已实现 | 零 LLM 成本，用任务自带 `selected_tools` 标注评估 `recall@k` / `precision@k` |
-| 编排器 ×4 `orchestrators/` | ✅ 已实现 | `react` / `planner_react` / `decomposing` / `react_router` |
+| 工具路由 `benchmark/tool_router.py` | ✅ 已实现 | 检索后端可插拔：稀疏 TF-IDF / 稠密向量 / **Hybrid 融合**（`pip install '.[dense]'` 启用，默认 bge-small-en-v1.5）+ 可选 LLM 精排，路由质量可离线评测 |
+| 离线路由评测 `eval_router.py` | ✅ 已实现 | 零 LLM 成本，用任务自带 `selected_tools` 标注评估 `recall@k` / `precision@k`；支持 `--retrieval tfidf/dense/hybrid` 与 Meta-Tool 离线仿真 `--meta_sim` |
+| 编排器 ×4 `orchestrators/` | ✅ 已实现 | `react` / `planner_react` / `decomposing` / **`meta_tool`**（元工具模式：LLM 显式 `_tool_search` 检索 → schema 动态注入，参考 Spring AI Alibaba；`react_router` 已移除） |
 | 执行器与验证器 `benchmark/executor.py` `benchmark/verifier.py` | ✅ 已实现 | SQL 终态验证，非动作序列验证 |
 | 离线评测闭环 `evaluate.py` + `compute_score.py` | ✅ 已实现 | 支持断点续跑、失败自动重试、多 run 统计 |
 | 分层记忆 | 🚧 设计中 | 短期会话记忆已进规划层，长期记忆未落地 |
@@ -70,8 +70,9 @@ Agent 领域不缺能跑通 toy task 的 demo，缺的是**能部署到真实企
 ### 1. 环境准备
 
 ```bash
-# 依赖（Python 3.11+，按需选 provider）
+# 依赖（Python 3.11+，按需选 provider；`--extra all` 已含 dense 检索依赖）
 uv sync --extra deepseek    # 或 --extra openai / anthropic / all
+uv sync --extra dense       # 稠密/Hybrid 检索（sentence-transformers + torch，可选）
 
 # 数据库快照
 unzip gym_dbs.zip
@@ -90,23 +91,24 @@ docker run -d -p 8001:8001 shivakrishnareddyma225/enterpriseops-gym-mcp-csm:late
 ### 3. 跑评测
 
 ```bash
-# 单个域（从 HuggingFace 拉任务配置）
+# 端到端（meta_tool 主通道；检索后端默认 hybrid，可 --retrieval tfidf 零依赖回退）
 python evaluate.py \
     --hf_dataset ServiceNow-AI/EnterpriseOps-Gym \
     --domain teams --mode oracle \
     --llm_config conf/llm/my-model.local.json \
-    --output_folder results/react/my-model/teams/oracle \
-    --orchestrator react \
+    --output_folder results/meta_tool/my-model/teams \
+    --orchestrator meta_tool \
+    --retrieval hybrid --embedding_model BAAI/bge-small-en-v1.5 \
     --concurrency 4 --num_runs 1
 
 # 离线工具路由评测（零 LLM 成本，迭代期首选）
 python eval_router.py --data_dir data/revised --top_k 20
 
 # 汇总通过率（论文口径：任务全 verifier 通过 = success）
-python compute_score.py --results_folder results/react/my-model/teams
+python compute_score.py --results_folder results/meta_tool/my-model/teams
 ```
 
-支持 `--orchestrator planner_react / decomposing / react_router`，以及 Ray 分布式编排 `ray_experiment_queue.py`。
+支持 `--orchestrator planner_react / decomposing / meta_tool`（meta_tool 另支持 `--retrieval tfidf / dense / hybrid`、`--embedding_model`、`--hybrid_alpha`），以及 Ray 分布式编排 `ray_experiment_queue.py`。
 
 ## 低预算验证方法
 
@@ -120,8 +122,8 @@ LLM provider 成本敏感时的推荐评测节奏（详见 `docs/HANDOFF.md`）�
 ## 目录结构
 
 ```
-├── benchmark/            # 执行器 / MCP 客户端 / LLM 客户端 / 验证器 / 工具路由器
-├── orchestrators/        # react / planner_react / decomposing / react_router
+├── benchmark/            # 执行器 / MCP 客户端 / LLM 客户端 / 验证器 / 工具路由器（dense_retriever.py = 稠密检索后端）
+├── orchestrators/        # react / planner_react / decomposing / meta_tool
 ├── eval_router.py        # 离线路由质量评测（零成本）
 ├── evaluate.py           # 评测执行器（断点续跑 · 失败重试）
 ├── compute_score.py      # 通过率汇总（论文口径）
