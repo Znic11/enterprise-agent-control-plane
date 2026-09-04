@@ -812,6 +812,17 @@ def main() -> None:
                          "--data_dir 任务以计算 final_recall(GT 仅离线用)")
     args = ap.parse_args()
 
+    # --analyze_meta_runs 单独使用(未带 --meta_sim 等评估意图)时短路为纯聚合:
+    # 只读 evaluate.py 产物,不建池、不跑粗筛、不加载 embedding 模型 —— 避免
+    # (a) 无谓的模型下载/加载;(b) 默认近似池跑出一份无关评估,其数字易被误读
+    # 为真池结论(近似池 desc 伪造,recall 虚高,别写简历)。
+    if args.analyze_meta_runs and not args.meta_sim:
+        analyze_meta_tool_runs(
+            args.analyze_meta_runs,
+            tasks=load_tasks(args.data_dir) or None,
+        )
+        return
+
     retrieval, embedder = resolve_retrieval(
         args.retrieval, args.embedding_model, args.embedding_device
     )

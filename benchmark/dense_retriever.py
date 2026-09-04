@@ -90,7 +90,11 @@ class SentenceTransformerEmbedder(TextEmbedder):
         self.encode_batch_size = encode_batch_size
         logger.info(f"[EMBED] loading model {model_name} on {self.device} ...")
         self._model = SentenceTransformer(model_name, device=self.device)
-        logger.info(f"[EMBED] model ready: {model_name} (dim={self._model.get_sentence_embedding_dimension()})")
+        # 新版 sentence-transformers 把维度查询更名为 get_embedding_dimension
+        # (旧名 get_sentence_embedding_dimension 触发 FutureWarning),兼容两者
+        self._dim_getter = getattr(self._model, "get_embedding_dimension", None) \
+            or self._model.get_sentence_embedding_dimension
+        logger.info(f"[EMBED] model ready: {model_name} (dim={self._dim_getter()})")
 
     @staticmethod
     def _auto_device() -> str:
@@ -105,7 +109,7 @@ class SentenceTransformerEmbedder(TextEmbedder):
         import numpy as np
 
         if not texts:
-            return np.zeros((0, self._model.get_sentence_embedding_dimension()), dtype=np.float32)
+            return np.zeros((0, self._dim_getter()), dtype=np.float32)
         vecs = self._model.encode(
             texts,
             batch_size=self.encode_batch_size,
