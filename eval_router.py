@@ -623,6 +623,9 @@ def analyze_meta_tool_runs(
     匹配任务 GT,计算 final_recall = |注入集 ∩ reachable GT| / |GT|(注入集 =
     meta_tool_injected;兜底全池的 run 单独标注,该口径会虚高)。⚠️ selected_tools
     仅在此离线聚合中作为 GT,运行期 orchestrator 从未读取它。
+
+    逐 run 记录 meta_tool_dispatch(inject/exec,老结果缺省按 inject),摘要与
+    明细表按此区分两种分发模式 —— 混跑两种模式的目录据此可比对。
     """
     files = sorted(glob.glob(os.path.join(results_dir, "results_*.json")))
     if not files:
@@ -643,6 +646,7 @@ def analyze_meta_tool_runs(
             }
             for k in META_TOOL_METRIC_KEYS:
                 row[k] = run.get(k, 0)
+            row["meta_tool_dispatch"] = run.get("meta_tool_dispatch", "inject")
             row["meta_tool_injected"] = run.get("meta_tool_injected", [])
             # 可选 final_recall:注入集(可用集)对可达 GT 的覆盖
             if by_prompt:
@@ -672,16 +676,23 @@ def analyze_meta_tool_runs(
         print(f"  meta_tool_hits_avg 均值(每检索命中工具数):     {sum(hit_vals) / len(hit_vals):.2f}")
     fb = [r for r in rows if r.get("meta_tool_fallback_all")]
     print(f"  触发全池兜底(fallback_all)的 run:               {len(fb)}")
+    disp_inj = sum(1 for r in rows if r.get("meta_tool_dispatch") == "inject")
+    disp_exec = n - disp_inj
+    print(f"  dispatch 分布(inject/exec):                    "
+          f"{disp_inj}/{disp_exec} "
+          f"(inject=动态 bind;exec=固定 [_tool_search,_execute_tool],"
+          f"真实工具经 _execute_tool 分发)")
     fr = [r for r in rows if "final_recall" in r]
     if fr:
         print(f"  final_recall(注入集覆盖可达 GT,均值):           "
               f"{sum(r['final_recall'] for r in fr) / len(fr):.1%} "
               f"({len(fr)} runs;兜底 run 会虚高,见上方标注)")
-    print(f"\n{'file':<34}{'run':>4}{'ok':>4}{'calls':>7}{'searches':>9}"
+    print(f"\n{'file':<34}{'run':>4}{'ok':>4}{'disp':>6}{'calls':>7}{'searches':>9}"
           f"{'cache':>7}{'zero':>6}{'fallback':>9}")
     for r in rows[:50]:
         print(f"{r['file'][:34]:<34}{int(r['run_number'] or 0):>4}"
               f"{'Y' if r.get('success') else '-':>4}"
+              f"{'exec' if r.get('meta_tool_dispatch') == 'exec' else 'inj':>6}"
               f"{int(r.get('meta_tool_search_calls', 0)):>7}"
               f"{int(r.get('meta_tool_searches', 0)):>9}"
               f"{int(r.get('meta_tool_cache_hits', 0)):>7}"

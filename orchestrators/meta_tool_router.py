@@ -48,6 +48,7 @@ from .base import AgentOrchestrator
 logger = logging.getLogger(__name__)
 
 TOOL_SEARCH_NAME = "_tool_search"
+EXECUTE_TOOL_NAME = "_execute_tool"
 DEFAULT_SEARCH_TOP_K = 6        # 每次 _tool_search 检索返回工具数(沿用历史初值)
 DEFAULT_SEARCH_MIN_SCORE = 0.03  # 检索分数下限(拍脑袋初值,未调参)
 DEFAULT_CACHE_SIZE = 64         # 同会话 query->hits 缓存上限
@@ -84,6 +85,44 @@ def build_tool_search_def() -> Dict[str, Any]:
                 },
             },
             "required": ["query"],
+        },
+    }
+
+
+def build_execute_tool_def() -> Dict[str, Any]:
+    """构造"统一执行"元工具 schema(dispatch=exec 模式专用)。
+
+    方案 Y:bind 集永远固定为 [_tool_search, _execute_tool](前缀稳定,
+    KV/前缀缓存友好)。模型先 _tool_search 看到命中工具的完整 schema
+    (在 ToolMessage 返回里),再调 _execute_tool(name, args) 显式执行 ——
+    真实工具名作为"字符串参数"传给元工具,由 orchestrator 拦截后分发到
+    全池执行端。不依赖服务端对 bind 外工具名宽松/不校验,任何 FC 服务端
+    (OpenAI/DeepSeek 严格模式亦)都接受;执行入口唯一,便于统一校验/审计。
+    """
+    return {
+        "name": EXECUTE_TOOL_NAME,
+        "description": (
+            "Execute a real business tool by its exact name. Call this AFTER "
+            "_tool_search returned matching tools and you have read their full "
+            "input schemas. Provide the EXACT tool name from the search results "
+            "and arguments conforming to that tool's schema. This is the ONLY "
+            "way to trigger a real tool with side effects."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact name of the tool to execute (one of "
+                                   "the names returned by _tool_search).",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Arguments conforming to the named tool's "
+                                   "input schema (shown in the _tool_search result).",
+                },
+            },
+            "required": ["name"],
         },
     }
 
@@ -139,6 +178,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
         embedding_device: Optional[str] = None,
         embedder: Any = None,
         hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
+        dispatch: str = "inject",
     ):
         super().__init__(
             llm_client=llm_client,
@@ -161,6 +201,9 @@ class MetaToolOrchestrator(AgentOrchestrator):
         self.fallback_all_after_zero_hits = fallback_all_after_zero_hits
         self.retrieval = retrieval
         self.hybrid_alpha = hybrid_alpha
+        if dispatch not in ("inject", "exec"):
+            raise ValueError(f"dispatch must be 'inject' or 'exec', got {dispatch!r}")
+        self.dispatch = dispatch
 
         # 检索后端:默认 tfidf(纯 stdlib);dense/hybrid 时优先用注入的 embedder
         # (单测/调用方提供),否则经 get_embedder 拿模块级单例(每进程加载一次)。
@@ -237,7 +280,11 @@ class MetaToolOrchestrator(AgentOrchestrator):
         调用这些工具 —— 严格 function-calling 下 _tool_search 永远合法。
         """
         tools: List[Dict[str, Any]] = [build_tool_search_def()]
-        if self._fallback_all:
+        if self.dispatch == "exec":
+            # 方案 Y:bind 集永远固定 [_tool_search, _execute_tool] —— 前缀稳定,
+            # KV/前缀缓存友好(真实工具绝不进 bind 集,只经 _execute_tool 分发)。
+            tools.append(build_execute_tool_def())
+        elif self._fallback_all:
             tools.extend(self.available_tools)
         else:
             tools.extend(
@@ -340,11 +387,30 @@ class MetaToolOrchestrator(AgentOrchestrator):
             }
             if newly_added:
                 payload["newly_added"] = newly_added
-                note = (
-                    "Tools matching your search are now bound and callable: "
-                    f"{', '.join(newly_added)}. Call the one that fits your need "
-                    "using its schema."
-                )
+                if self.dispatch == "exec":
+                    # 方案 Y:命中工具不进 bind 集,必须把完整 schema 文本回喂,
+                    # 模型才能通过 _execute_tool 填对参数。仅首次注入时给全量,
+                    # 已注入工具只列名字(避免上下文膨胀)。
+                    schemas = {
+                        n: self._all_tools_by_name[n].get(
+                            "input_schema",
+                            self._all_tools_by_name[n].get("inputSchema", {}),
+                        )
+                        for n in newly_added
+                    }
+                    payload["schemas"] = schemas
+                    note = (
+                        "New tools are available. Call _execute_tool with the "
+                        "exact tool name and args matching its schema above: "
+                        f"{', '.join(newly_added)}. Already-available tools: "
+                        f"{', '.join(self._injected)}."
+                    )
+                else:
+                    note = (
+                        "Tools matching your search are now bound and callable: "
+                        f"{', '.join(newly_added)}. Call the one that fits your need "
+                        "using its schema."
+                    )
         else:
             # 零命中:回喂引导,绝不中断;连续达阈值触发全池兜底防死锁
             self.zero_hits += 1
@@ -366,14 +432,27 @@ class MetaToolOrchestrator(AgentOrchestrator):
                 and not self._fallback_all
             ):
                 self._fallback_all = True
-                payload["note"] = (
-                    "Repeated searches found no match. The full tool pool is now "
-                    "bound and available - call the exact tool you need directly."
-                )
-                logger.warning(
-                    f"[META-TOOL] {self._consecutive_zero} consecutive zero-hit "
-                    f"searches; fell back to binding the full pool"
-                )
+                if self.dispatch == "exec":
+                    # 方案 Y:bind 集必须保持固定(前缀缓存友好),不能 bind 全池;
+                    # 兜底改为给出全池工具名单,引导模型用 _execute_tool 直接点名。
+                    payload["note"] = (
+                        "Repeated searches found no match. All pool tools are: "
+                        f"{', '.join(sorted(self._all_tools_by_name))}. Call "
+                        "_execute_tool with the exact name and best-guess args."
+                    )
+                    logger.warning(
+                        f"[META-TOOL] {self._consecutive_zero} consecutive zero-hit "
+                        f"searches; exec mode: listed full pool names instead of binding"
+                    )
+                else:
+                    payload["note"] = (
+                        "Repeated searches found no match. The full tool pool is now "
+                        "bound and available - call the exact tool you need directly."
+                    )
+                    logger.warning(
+                        f"[META-TOOL] {self._consecutive_zero} consecutive zero-hit "
+                        f"searches; fell back to binding the full pool"
+                    )
 
         return {"success": True, "result": payload, "error": None}, note
 
@@ -389,6 +468,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
             "meta_tool": True,
             "meta_tool_retrieval": self.retrieval,
             "meta_tool_hybrid_alpha": self.hybrid_alpha,
+            "meta_tool_dispatch": self.dispatch,
             "meta_tool_search_calls": self.search_calls,
             "meta_tool_searches": self.searches,
             "meta_tool_cache_hits": self.cache_hits,
@@ -473,6 +553,51 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         f"[META-TOOL] search query='{tool_args.get('query', '')}' "
                         f"-> found={tool_result['result'].get('count', 0)}"
                     )
+                elif tool_name == EXECUTE_TOOL_NAME:
+                    # 方案 Y:统一执行元工具 -> 解析 (name, args) -> 校验池内 ->
+                    # 分发到真实执行。bind 集固定,真实工具永不 bind;报错在此
+                    # 集中捕获并回喂,便于引导模型自纠。
+                    real_name = str((tool_args or {}).get("name", "")).strip()
+                    real_args = (tool_args or {}).get("args") or {}
+                    target_gym = None
+                    if real_name not in self._all_tools_by_name:
+                        logger.error(
+                            f"[META-TOOL] _execute_tool -> unknown real tool "
+                            f"'{real_name}'; guiding back to {TOOL_SEARCH_NAME}"
+                        )
+                        tool_result = {
+                            "success": False,
+                            "error": (
+                                f"Tool '{real_name}' does not exist in the tool "
+                                f"pool. Use {TOOL_SEARCH_NAME} to find the exact "
+                                f"name, then retry {EXECUTE_TOOL_NAME}."
+                            ),
+                        }
+                    else:
+                        if real_name not in self._injected:
+                            self._admit(real_name)
+                        try:
+                            exec_result = await self._execute_tool_call(
+                                real_name, real_args
+                            )
+                            tool_result = exec_result["result"]
+                            target_gym = exec_result["gym_server"]
+                            logger.info(
+                                f"Tool result success: {tool_result.get('success')}"
+                            )
+                            if real_name not in tools_used:
+                                tools_used.append(real_name)
+                        except Exception as e:  # noqa: BLE001 — 单次失败不中断 run
+                            logger.error(
+                                f"Tool '{real_name}' execution failed via "
+                                f"{EXECUTE_TOOL_NAME}: {e}"
+                            )
+                            tool_result = {
+                                "success": False,
+                                "error": f"{type(e).__name__}: {e}",
+                            }
+                    # 审计工具名用真实工具名(而非包装层 _execute_tool)
+                    tool_name = real_name
                 elif tool_name in self._all_tools_by_name:
                     # 真实工具:严格 FC 下它必然在本轮 bind 集内(此前已注入);
                     # 防御性放行(若因异常未注入则补注入)。

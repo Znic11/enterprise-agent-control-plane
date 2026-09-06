@@ -193,7 +193,7 @@ async def execute_sample(
     orchestrator="react", planner_llm_config=None, max_num_attempts=5,
     meta_tool_top_k=6, meta_tool_min_score=0.03, meta_warmup_top_k=None,
     retrieval="hybrid", embedding_model=None, embedding_device=None,
-    hybrid_alpha=0.5,
+    hybrid_alpha=0.5, tool_dispatch="inject",
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -226,6 +226,7 @@ async def execute_sample(
             orchestrator_kwargs["embedding_model"] = embedding_model
         orchestrator_kwargs["embedding_device"] = embedding_device
         orchestrator_kwargs["hybrid_alpha"] = hybrid_alpha
+        orchestrator_kwargs["dispatch"] = tool_dispatch
 
     executor = BenchmarkExecutor(
         config,
@@ -342,6 +343,18 @@ async def main():
              "first turn alongside _tool_search. Omit/None = pure Meta-Tool "
              "single channel (meta_tool only).",
     )
+    parser.add_argument(
+        "--tool_dispatch",
+        type=str,
+        default="inject",
+        choices=["inject", "exec"],
+        help="How retrieved real tools reach execution (meta_tool only). "
+             "'inject' = dynamic bind into the per-turn tool set (legacy, "
+             "prefix changes each turn). 'exec' = fixed bind of "
+             "[_tool_search, _execute_tool]; retrieved tools are returned with "
+             "full schema in the message and executed via _execute_tool(name, "
+             "args), keeping the bind prefix stable for KV/prefix caches.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
@@ -409,6 +422,7 @@ async def main():
                 embedding_model=args.embedding_model,
                 embedding_device=args.embedding_device,
                 hybrid_alpha=args.hybrid_alpha,
+                tool_dispatch=args.tool_dispatch,
             ),
             concurrency=int(args.concurrency),
         )
