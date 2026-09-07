@@ -11,6 +11,7 @@ dist/
 results/
 logs/
 *.log
+out/
 
 # Databases / archives (restore via gym_dbs.zip, see README)
 gym_dbs/
