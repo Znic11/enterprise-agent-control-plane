@@ -2,7 +2,7 @@
 
 > 交接日期:2026-09-07 · 交接人:上一会话 · 接收人:新会话模型(对外呈现/新模块)
 > 阅读顺序:本文档 → `docs/tool_router_design.md`(路由详细设计,Phase-1 权威)→ `docs/agent_design_plan.md`(总方案)→ `.workbuddy/memory/`(按日日志,09-07/09-06 最新)
-> 版本说明:本版在 2026-09-03 版基础上由 09-04(dense/hybrid、react_router 移除)、09-05(oracle 口径发现)、09-06(dispatch=exec)、09-07(email 全量池配对)会话持续补记;**工具检索/分发主线已收尾**,当前重心 = 对外呈现(§6 #3);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
+> 版本说明:本版在 2026-09-03 版基础上由 09-04(dense/hybrid、react_router 移除)、09-05(oracle 口径发现)、09-06(dispatch=exec)、09-07(email 全量池配对 + **Phase 2 verifier-in-the-loop V1 落地与配对结果,§4.6.7**)会话持续补记;工具检索/分发主线已收尾,Phase 2 验证闭环 V1 已落地(方向证据,未显著);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
 
 ---
 
@@ -11,6 +11,7 @@
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研"企业级 LLM Agent",核心卖点 = 用**检索+LLM 的工具路由逼近 oracle 模式**(把"答案泄露"变成"能力预测"),以可复现实验证明有效性,作为面试核心项目;代码同步沉淀在 GitHub 作品集 `enterprise-agent-control-plane`(= 本仓库 origin)。
 2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);09-06 新增 **dispatch=exec(方案 Y)**(固定 bind 保前缀缓存,`e797cc0`);单测 **61/61 通过**(§2),提交状态见 §3.3/§4.6。
 3. **hybrid e2e 已跑出(100 runs / 31.0%),oracle 口径对检索无区分度(09-05 关键发现)**:用户首轮小样本端到端 meta_tool 32.35% vs react-oracle 30.39%(非显著);hybrid 真池离线数字已出(§4.6.3:meta_sim final_recall 31.9% vs tfidf 27.5%、zero% 6%→0);端到端 `--retrieval hybrid` 100 runs 成功 31(31.0%,hr/oracle)。**口径红线**:oracle 模式 executor 把可用池过滤成 selected_tools(GT)白名单 → `_tool_search` 只在"答案池"里检索,检索后端对成功率**无区分度** → 31.0% vs 32.35% 的差异 = 单次运行噪声。hybrid 有效性的真正证据 = **带干扰工具的全量池 AB 对照(§4.6.6)**:09-07 email 域 67 tasks 配对已闭环 —— **exec/hybrid 53.73% ≈ inject/hybrid(同池,差异很小)≈ react-oracle 基线 59.70% 的 90%**,工具检索/分发主线收尾;dispatch=exec(方案 Y,固定 bind 保前缀缓存)已入库 `e797cc0`。
+4. **Phase 2 verifier-in-the-loop V1 已落地并跑出方向证据(§4.6.7)**:收尾门禁(claim-done 不再直接 break,强制业务只读工具回读核对 checklist,红线内零 verifier 触达)email 域配对 **clean 64.06% vs baseline 55.38%**(+8.7pp,saved 8/regressed 3,**McNemar p=0.227 未显著**);代价:执行耗时 ~2.33x / LLM 轮次 ~1.5x;单测 66/66;分析脚本 analyze_vloop_runs.py。**下一步 = 第二卷定显著性 + Phase 3 分层记忆(设计先行)**。
 
 ---
 
@@ -56,7 +57,7 @@
 - full_cov 坑:32/160 GT 引用其他域容器工具(不可达),须按 reachable 口径排除(999c15d),否则 full_cov=0 误报。
 
 ### 3.3 相关 commit 链(main,新→旧)
-`e797cc0`(09-06 feat(meta_tool): dispatch=exec 固定 bind 模式/方案 Y + --tool_dispatch + analyze dispatch 维度;§4.6.6) ← `435c530`(docs: 回填 09-05 hybrid e2e 数字与 oracle 口径发现 §4.6.5) ← `2449049`(fix(llm_client): provider 缺依赖报错带 extra 安装提示) ← `21ee47b`(fix(evaluate): configs_folder 无 *.json 显式报错) ← `b66e82f`(docs: 服务端真池 hybrid 数字与运维 hotfix) ← `086bcea`(fix(deps): 补声明 nest_asyncio/aiohttp) ← `f8820d5`(fix(eval): analyze_meta_runs 短路纯聚合 + ST 维度 FutureWarning) ← `25068d1`(fix(packaging): 显式 setuptools 包发现) ← `6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit 01acad1) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
+`3c2e67e`(feat(scripts): analyze_vloop_runs 收口分析) ← `a68dde3`(09-07 feat(meta_tool): verifier-in-the-loop 收尾门禁 V1,--verify_loop) ← `e797cc0`(09-06 feat(meta_tool): dispatch=exec 固定 bind 模式/方案 Y + --tool_dispatch + analyze dispatch 维度;§4.6.6) ← `435c530`(docs: 回填 09-05 hybrid e2e 数字与 oracle 口径发现 §4.6.5) ← `2449049`(fix(llm_client): provider 缺依赖报错带 extra 安装提示) ← `21ee47b`(fix(evaluate): configs_folder 无 *.json 显式报错) ← `b66e82f`(docs: 服务端真池 hybrid 数字与运维 hotfix) ← `086bcea`(fix(deps): 补声明 nest_asyncio/aiohttp) ← `f8820d5`(fix(eval): analyze_meta_runs 短路纯聚合 + ST 维度 FutureWarning) ← `25068d1`(fix(packaging): 显式 setuptools 包发现) ← `6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit 01acad1) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
 
 ---
 
@@ -262,6 +263,23 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
   2. **全量池检索 ≈ oracle 基线 90%**(53.73/59.70):exec+meta_tool 在"从干扰工具里挑"的难度下仍接近"答案在手边"的 react-oracle → 检索+分发未显著损失成功率。与 react 表的 6pp 差 = **全量池 vs 白名单的难度差,不是误差**,不可当"方案落后基线"讲;
   3. **限定条件**:仅 email 域、67 tasks、单 run 配对;**域间绝对数不可比**(hr 域全量池仅 19-24% vs email 54% —— 域难度/池大小差异),报告只做同域配对,跨域比较会被追问;2 个 error 文件未归类(若集中于 `_execute_tool` 未知名/参数错 → exec 提示问题,超时/网络则忽略)。
 
+### 4.6.7 09-07 补记:Phase 2 verifier-in-the-loop V1 落地 + email 域配对(方向证据,未显著)
+
+- **机制(红线内实现,commit `a68dde3`)**:`MetaToolOrchestrator(verify_loop=True)` 只改 break 点 —— 模型无 tool_call 声称完成时**不直接收工**,注入核查轮:首轮专用规划调用让模型自列验收 checklist(user_prompt+域政策推导,注入带 `stage=verify_loop_checklist`);gate 阶段须有 **≥1 次成功业务只读工具调用**(启发式 `_is_read_only_tool_name`,仅计数不阻断)才放行 FINAL;无证据反复声称 → 有界提醒(`--verify_max_rounds=3`,实测 0 触发)后强制收尾打 `vl_forced_done`。**全程不读 verifiers 字段**(SQL/expected 零触达),自查通道 = 业务只读工具,零 /api/sql-runner;与 selected_tools 同级红线。evaluate.py `--verify_loop`/`--verify_max_rounds`;metadata 落 `vl_*` 10 字段;单测 66/66(TestVerifyLoop 5 例)。收口分析脚本 `scripts/analyze_vloop_runs.py`(commit `3c2e67e`):单卷 vl_* 行为 / 配对翻转+McNemar 精确 p / error 归类 / demo 抽取。
+- **服务端结果(email/oracle 67 configs 全量池,deepseek-v4-flash,与 §4.6.6 baseline 同池同模型;clean 文件口径)**:
+
+| 卷 | Success(clean) | Verifier Pass 均值 | Errors | 执行耗时均值 | LLM 轮次均值 |
+|---|---|---|---|---|---|
+| baseline(exec/hybrid,§4.6.6) | 36/65 = **55.38%** | 73.67% | 2 | 385s | 8.5 |
+| **+ verify_loop**(本次) | 41/64 = **64.06%** | 81.17% | 3(全 timeout) | **898s(2.33x)** | **12.7(1.49x,+1 规划)** |
+
+- **配对翻转(63 干净对)**:saved **8**(baseline fail→pass)/ regressed **3**(pass→fail)/ both_pass 33 / both_fail 19;**McNemar p=0.227,未达显著**。saved 8 例 final 均为"Let me verify each item on the acceptance checklist…✅",救回的是验收字段漏写/写错型失败(草稿 subject/正文、转发配置、CSE 密钥启用、线程修改等);regressed 3 例中 1 例为后端 FK 约束持续报错(环境性),另 2 例疑似单 run 噪声,未见 gate 系统性破坏。gate 行为:64/64 触发(100%,因任务均以文本收尾)、forced_done=0、只读证据 64/64、corrections 均值 1.58、reminders 均值 0.08、**FINAL 标记率 0%(模型不遵守 "FINAL:" 前缀——不强校验,仅统计,无影响)**。
+- **解读(汇报口径,⚠️ 勿越界)**:
+  1. 机制有效性与"半途而废救场"有**直接定性证据**(8 saved 的对话轨迹),但 **+8.7pp 是单 run、配对 p=0.227 不显著**,不可写"显著提升";方向性证据 + 演示素材,需**第二卷(再跑 1 seed 或 teams 域)配 McNemar 合并**才有统计结论;
+  2. **成本代价显著:执行耗时 ~2.33x、LLM 轮次 ~1.5x**(100% 任务都被 gate + 每任务 1 次规划调用 + 平均 1.58 纠错回合)→ 报告必须写成本,面试被问"值不值"时给 saved/regressed + 成本三角;
+  3. 3 个 error 全为 timeout(verify_loop 拉长单任务 → 同 concurrency 超时概率上升),建议降 concurrency 或调大 LLM 超时;
+  4. 域限定:仅 email;clean 口径 64.06% 与含 error 的 compute_score 口径 61.19% 不同,引用须注明口径。
+
 ---
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
@@ -273,6 +291,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 5. **【已知行为】** `_tool_search` 零词法+低语义(如幻觉名)→ 零命中 → 回喂引导不中断;连续 3 次零命中兜底 bind 全池防死锁(hybrid 下 zero% 已归零,兜底预计很少触发)。
 6. **【潜在 bug,已单测覆盖】** LLM 一次发多个 tool_call 的并行处理、注入说明插入位置 —— 单测已覆盖;`tool_call_id` 真实端到端匹配与 hybrid 下 bge 编码耗时仍需服务端验证。
 7. **【环境坑】** 服务器 sentence-transformers + torch 安装体积大;bge 首次下载设 `HF_ENDPOINT=https://hf-mirror.com`;Python 3.14 需 numpy≥2.3(cp314)。**依赖只信 pyproject**:uv sync 只装声明的依赖,老环境手工装过的包(nest_asyncio/aiohttp 等)在新装环境会缺 → 已补声明(`086bcea`);再遇 ModuleNotFoundError 照提示补装并把包名回报。
+8. **【待定论】verify_loop 有效性:方向证据、未显著、成本高**(§4.6.7):email 配对 saved 8/regressed 3、McNemar p=0.227(单 run);clean 成功率 +8.7pp 但执行耗时 ~2.33x、LLM 轮次 ~1.5x。需第二卷(同池再 1 seed 或 teams 域)合并定显著性;若显著则"半途而废救场"叙事成立,再评估降本(是否只对高风险任务启 gate / gate 提示精简)。FINAL 前缀模型不遵守(0%),不强校验仅统计。
 
 ---
 
@@ -289,11 +308,11 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 | 7 | 【P2】bge 选型与 query 指令实验:bge-small vs bge-base vs e5;`query_instruction` 是否开启(当前空串)对域内检索的影响 | #4 环境 | 检索质量上限 |
 | 8 | 【P2】稠密通道噪声诊断:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #4 数据 | 误报控制 |
 | 9 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #4 数据 | 即得 recall 增益 |
-| 10 | **【P0,Phase 2 启动】verifier-in-the-loop 验证闭环自纠正**:设计/实现指引见 docs/NEXT_SESSION_PROMPT.md(09-07 版)与 agent_design_plan §3.2/§5 Phase 2。⚠️ 判据由人类专家离线编写、**不随任务告知 agent**;且 orchestrator 代码上可触达 self.config.verifiers(executor L409 传全量 config)→ 禁止注入 prompt/自查依据/纠错信号,自查只走只读通道、标准从任务描述+域政策推导 | 工具主线已收尾 | 取代 LLM 自评合规;Phase 2 首块 |
+| 10 | **【🔄 Phase 2 验证闭环,V1 已落地待定论】verifier-in-the-loop 收尾门禁**:设计/实现见 NEXT_SESSION_PROMPT(09-07)与 §4.6.7。判据红线(人类专家离线编写、不随任务告知 agent;orchestrator 可触达 self.config.verifiers 但**禁止**注入/自查/纠错)全程遵守,自查只走业务只读工具 + 首轮 checklist。email 配对 clean +8.7pp(saved 8/regressed 3,**McNemar p=0.227 未显著**),成本 ~2.33x 耗时。**下一步:第二卷(同池再 1 seed 或 teams 域)合并定显著性 → 达标后回填为"已验证"** | ✅ V1(a68dde3 + 3c2e67e) | Phase 3 记忆前置;取代 LLM 自评合规 |
 
-✅ 已完成(2026-08-31~09-07):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(本节 #1/§4.6.6)**。
+✅ 已完成(2026-08-31~09-07):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(§4.6.6)**;**Phase 2 verifier-in-the-loop V1(a68dde3)+ 收口分析脚本(3c2e67e)+ email 配对方向证据(§4.6.7,未显著,p=0.227)**。
 
-长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正 → 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
+长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正(→ 第二卷定显著性)→ 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
 
 ---
 
@@ -304,7 +323,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 - 评估:`eval_router.py`(离线,`--tools tools_dump.json` 真实池;`--retrieval auto|tfidf|dense|hybrid`;`--meta_sim`)、`evaluate.py`(端到端;ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool;`--retrieval` 默认 hybrid)、`compute_score.py`、`RUN_GUIDE.md`(服务端容器/评测全流程)、`scripts/analyze_router_misses.py`(漏检归因)
 - 数据:`tools_dump.json`(512→458,_domain 分域)、`gym_dbs.zip`
 - 作品集:GitHub `enterprise-agent-control-plane`(README:实现状态如实标注)
-- 记忆:`.workbuddy/memory/2026-09-07.md`(本会话:email 全量池配对 + 工具主线收尾)、2026-09-06(dispatch=exec 落地 e797cc0 + X/Y 分析)、2026-09-05(全量池方案/oracle 口径)、09-04(dense/hybrid 落地)、09-03(ToolLLM 调研+意图检索落地)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
+- 记忆:`.workbuddy/memory/2026-09-07.md`(本会话:email 全量池配对 + 工具主线收尾 + **Phase 2 V1 落地/配对结果**)、2026-09-06(dispatch=exec 落地 e797cc0 + X/Y 分析)、2026-09-05(全量池方案/oracle 口径)、09-04(dense/hybrid 落地)、09-03(ToolLLM 调研+意图检索落地)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
 
 ---
-*本文档由 2026-09-07 会话补记(email 域全量池配对结论 + dispatch=exec 方案 Y;HEAD = e797cc0,§4.6.6),供新会话无缝接手。实现状态均已如实标注;工具检索/分发主线已收尾,下一步重心 = 对外呈现/README 回填(§6 #3)。*
+*本文档由 2026-09-07 会话补记(email 域全量池配对 + Phase 2 verifier-in-the-loop V1 落地与配对结果 §4.6.7;HEAD = a68dde3,功能链 a68dde3←e797cc0;分析脚本 3c2e67e),供新会话无缝接手。实现状态均已如实标注(verify_loop 方向证据、McNemar p=0.227 未显著、成本 ~2.33x);下一步 = 第二卷定显著性 + Phase 3 分层记忆设计先行。*
