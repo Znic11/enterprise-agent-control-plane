@@ -56,6 +56,52 @@ DEFAULT_ZERO_HIT_FALLBACK = 3   # 连续零命中达此值 -> 兜底绑定全池
 DEFAULT_RETRIEVAL = "tfidf"     # 检索后端默认 tfidf(纯 stdlib 保单测/离线一致);
                                 # evaluate.py 端到端 CLI 默认 hybrid(evaluate 边界显式指定)
 
+# ---------------------------------------------------------------------------
+# verifier-in-the-loop(验证闭环,V1):仅在"宣布完成前"强制一轮终态核对。
+# 红线:全程不读 self.config.verifiers(判据 SQL/expected_value 均不触达);
+# 自查只走业务只读工具通道,标准 = 首轮模型自列的验收 checklist(从 user_prompt
+# + 域政策推导),纠错信号 = "回读观察到的状态 vs 任务目标",非评分者信息。
+# ---------------------------------------------------------------------------
+DEFAULT_VERIFY_MAX_ROUNDS = 3   # gate 阶段"无只读证据就声称完成"的最大提醒次数;
+                                # 达上限强制收尾并打 vl_forced_done(有界,绝不空转)
+
+# 只读工具名启发式:用于断言 gate 阶段确实发生"读"证据(find_/get_/list_/...;
+# email 域工具多为 email_get_/email_list_ 前缀)。仅用于计数/提醒,不阻断任何执行。
+_RO_VERBS = frozenset({
+    "get", "list", "find", "search", "retrieve", "check", "lookup", "read",
+    "show", "view", "describe", "fetch", "count", "verify", "email_get", "email_list",
+})
+
+
+def _is_read_only_tool_name(name: str) -> bool:
+    """按工具名前缀判断是否只读查询类(启发式,见 _RO_VERBS)。"""
+    toks = str(name or "").lower().split("_")
+    return bool(toks and (toks[0] in _RO_VERBS or "_".join(toks[:2]) in _RO_VERBS))
+
+
+VL_PLANNING_PROMPT = (
+    "Before performing the task, state your acceptance checklist: the concrete "
+    "facts that must be true in the system when the task is complete, derived "
+    "from the user request and the domain policy (entities to create/update, "
+    "fields and their expected values, links/relationships to verify). "
+    "Reply with ONLY a compact numbered checklist. Do not call any tool now."
+)
+
+VL_GATE_MESSAGE = (
+    "You indicated the task is complete. Before finalizing, verify the final "
+    "state against the acceptance checklist you stated at the start: every "
+    "item must be true in the system NOW. Re-read the entity/entities you "
+    "created or modified with read-only tools (get/find/list/search/retrieve...). "
+    "If any item does not match, fix it first, then re-verify. When verified, "
+    "reply with your final summary starting with 'FINAL:'."
+)
+
+VL_REMIND_MESSAGE = (
+    "Your completion message did not include evidence from a read-only tool "
+    "call. Re-read the affected entity/entities with a read-only tool and "
+    "confirm their current state before replying 'FINAL:'."
+)
+
 
 def build_tool_search_def() -> Dict[str, Any]:
     """构造元工具 schema。字段用 MCP 标准 inputSchema(驼峰),与 llm_client
@@ -179,6 +225,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
         embedder: Any = None,
         hybrid_alpha: float = DEFAULT_HYBRID_ALPHA,
         dispatch: str = "inject",
+        verify_loop: bool = False,
+        verify_max_rounds: int = DEFAULT_VERIFY_MAX_ROUNDS,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -194,6 +242,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
             raise ValueError(f"cache_size must be >= 1, got {cache_size}")
         if warmup_top_k is not None and warmup_top_k < 1:
             raise ValueError(f"warmup_top_k must be >= 1 or None, got {warmup_top_k}")
+        if verify_max_rounds < 1:
+            raise ValueError(f"verify_max_rounds must be >= 1, got {verify_max_rounds}")
 
         self.tool_search_top_k = tool_search_top_k
         self.tool_search_min_score = tool_search_min_score
@@ -204,6 +254,21 @@ class MetaToolOrchestrator(AgentOrchestrator):
         if dispatch not in ("inject", "exec"):
             raise ValueError(f"dispatch must be 'inject' or 'exec', got {dispatch!r}")
         self.dispatch = dispatch
+        self.verify_loop = verify_loop
+        self.verify_max_rounds = verify_max_rounds
+
+        # verifier-in-loop 运行期状态(每次 execute() 开始重置)
+        self._vl_checklist: str = ""
+        self._vl_gate_active = False
+        self._vl_gate_rounds = 0
+        self._vl_no_read = 0
+        self._vl_read_calls = 0
+        self._vl_read_tools: List[str] = []
+        self._vl_correction_turns = 0
+        self._vl_forced_done = False
+        self._vl_accepted = False
+        self._vl_final_marker = False
+        self._vl_plan_calls = 0
 
         # 检索后端:默认 tfidf(纯 stdlib);dense/hybrid 时优先用注入的 embedder
         # (单测/调用方提供),否则经 get_embedder 拿模块级单例(每进程加载一次)。
@@ -457,6 +522,109 @@ class MetaToolOrchestrator(AgentOrchestrator):
         return {"success": True, "result": payload, "error": None}, note
 
     # ------------------------------------------------------------------
+    # verifier-in-loop(验证闭环 V1):首轮自列 checklist + 收尾强制只读回读
+    # ------------------------------------------------------------------
+
+    def _reset_vl_state(self) -> None:
+        """每次 execute() 开始时重置运行期状态(或chestrator 每任务新实例,双保险)。"""
+        self._vl_checklist = ""
+        self._vl_gate_active = False
+        self._vl_gate_rounds = 0
+        self._vl_no_read = 0
+        self._vl_read_calls = 0
+        self._vl_read_tools = []
+        self._vl_correction_turns = 0
+        self._vl_forced_done = False
+        self._vl_accepted = False
+        self._vl_final_marker = False
+        self._vl_plan_calls = 0
+
+    def _append_system_note(
+        self,
+        messages: List[Any],
+        conversation_flow: List[Dict[str, Any]],
+        note: str,
+        stage: Optional[str] = None,
+    ) -> None:
+        """追加一条 [system] 文本说明(插在全部 ToolMessage 之后,下一轮 AI 前可见),
+        并同步 conversation_flow(带 stage 便于审计/演示样例提取)。"""
+        messages.append(HumanMessage(content=f"[system] {note}"))
+        entry: Dict[str, Any] = {"type": "system_message", "content": note}
+        if stage:
+            entry["stage"] = stage
+        conversation_flow.append(entry)
+
+    async def _elicit_checklist(
+        self,
+        messages: List[Any],
+        conversation_flow: List[Dict[str, Any]],
+    ) -> None:
+        """首轮用一次专用调用让模型自列验收 checklist(不 bind 工具、不执行任何
+        调用)。checklist 由模型从 user_prompt + 域政策推导 —— 标准可审计、
+        域无关、零 verifier 泄露。非空则注入主会话供全程与收尾参照。"""
+        self._vl_plan_calls += 1
+        plan_messages = [
+            SystemMessage(content=self.config.system_prompt),
+            HumanMessage(content=self.config.user_prompt),
+            HumanMessage(content=VL_PLANNING_PROMPT),
+        ]
+        try:
+            response = await self.llm_client.invoke_with_tools(plan_messages, [])
+        except Exception as e:  # noqa: BLE001 — 规划失败不致命,gate 消息仍可兜底
+            logger.error(f"[VERIFY-LOOP] checklist elicitation failed: {e}")
+            return
+        text = get_text_content(response.content)
+        checklist = (text or "").strip()
+        if not checklist:
+            logger.warning("[VERIFY-LOOP] empty checklist from model; skip injection")
+            return
+        self._vl_checklist = checklist[:2000]
+        self._append_system_note(
+            messages,
+            conversation_flow,
+            "Acceptance checklist (self-derived, verify each item before FINAL):\n"
+            + self._vl_checklist,
+            stage="verify_loop_checklist",
+        )
+        logger.info(
+            f"[VERIFY-LOOP] acceptance checklist elicited "
+            f"({len(self._vl_checklist)} chars)"
+        )
+
+    def _vl_note_real_tool(self, real_name: str, success: bool) -> None:
+        """gate 激活期间记录成功的只读证据(业务只读工具调用)。"""
+        if not self._vl_gate_active or not success:
+            return
+        if _is_read_only_tool_name(real_name):
+            self._vl_read_calls += 1
+            if real_name not in self._vl_read_tools:
+                self._vl_read_tools.append(real_name)
+
+    def _verify_gate_step(self) -> Tuple[bool, Optional[str], Optional[str]]:
+        """收尾门禁判定。返回 (accept_done, note, stage):
+        - verify_loop 关:直接放行(行为与旧版完全一致)。
+        - 首次声称完成:激活 gate,注入核查引导(不直接 break)。
+        - 已激活且有只读证据:放行(证据 = 真实调过业务只读工具)。
+        - 已激活但无证据:提醒;达 verify_max_rounds 强制收尾(vl_forced_done)。
+        """
+        if not self.verify_loop:
+            return True, None, None
+        if not self._vl_gate_active:
+            self._vl_gate_active = True
+            return False, VL_GATE_MESSAGE, "verify_loop_gate"
+        if self._vl_read_calls > 0:
+            return True, None, None
+        self._vl_no_read += 1
+        if self._vl_no_read >= self.verify_max_rounds:
+            self._vl_forced_done = True
+            logger.warning(
+                f"[VERIFY-LOOP] no read evidence after {self._vl_no_read} "
+                f"reminder(s); forcing done"
+            )
+            return True, None, None
+        return False, VL_REMIND_MESSAGE, "verify_loop_remind"
+
+    # ------------------------------------------------------------------
     # 元数据(审计/离线指标)
     # ------------------------------------------------------------------
 
@@ -464,7 +632,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
         """Surface Meta-Tool telemetry so experiments can audit & compute
         offline metrics (meta_tool_searches / hits_avg / cache_hits ...).
         """
-        return {
+        meta: Dict[str, Any] = {
             "meta_tool": True,
             "meta_tool_retrieval": self.retrieval,
             "meta_tool_hybrid_alpha": self.hybrid_alpha,
@@ -480,12 +648,26 @@ class MetaToolOrchestrator(AgentOrchestrator):
             "meta_tool_fallback_all": bool(self._fallback_all),
             "meta_tool_warmup_names": list(self._warmup_names),
         }
+        if self.verify_loop:
+            meta["vl_enabled"] = True
+            meta["vl_checklist"] = self._vl_checklist[:500]
+            meta["vl_gate_rounds"] = self._vl_gate_rounds
+            meta["vl_read_calls_gate"] = self._vl_read_calls
+            meta["vl_read_tools"] = list(self._vl_read_tools)
+            meta["vl_no_read_reminders"] = self._vl_no_read
+            meta["vl_correction_turns"] = self._vl_correction_turns
+            meta["vl_forced_done"] = self._vl_forced_done
+            meta["vl_plan_calls"] = self._vl_plan_calls
+            meta["vl_final_marker"] = self._vl_final_marker
+        return meta
 
     # ------------------------------------------------------------------
     # 执行循环
     # ------------------------------------------------------------------
 
     async def execute(self) -> Dict[str, Any]:
+        if self.verify_loop:
+            self._reset_vl_state()
         messages = [
             SystemMessage(content=self.config.system_prompt),
             HumanMessage(content=self.config.user_prompt),
@@ -496,6 +678,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
         ]
         tools_used: List[str] = []
         tool_results: List[Dict[str, Any]] = []
+
+        # verifier-in-loop:首轮先让模型自列验收 checklist(不 bind、不执行任何工具)
+        if self.verify_loop:
+            await self._elicit_checklist(messages, conversation_flow)
 
         for iteration in range(self.max_iterations):
             visible = self._visible_tools()
@@ -531,8 +717,29 @@ class MetaToolOrchestrator(AgentOrchestrator):
             logger.info(f"LLM Response: {assistant_text}")
 
             if not response.tool_calls:
+                # verifier-in-loop:模型声称完成 ≠ 允许收工 —— 先过收尾门禁:
+                # 首次声称 -> 注入"按 checklist 用只读工具回读核对"的核查轮;
+                # 已核查且有只读证据 -> 放行;无证据反复声称 -> 有界提醒后强制收尾。
+                accept_done, gate_note, gate_stage = self._verify_gate_step()
+                if gate_note is not None:
+                    self._vl_gate_rounds += 1
+                    self._append_system_note(
+                        messages, conversation_flow, gate_note, stage=gate_stage
+                    )
+                    logger.info(
+                        f"[VERIFY-LOOP] gate active: injected {gate_stage} "
+                        f"(round {self._vl_gate_rounds}, read_evidence="
+                        f"{self._vl_read_calls})"
+                    )
+                    continue
+                if accept_done:
+                    self._vl_accepted = True
                 logger.info("No tool calls requested. Task complete.")
                 break
+
+            if self.verify_loop and self._vl_gate_active:
+                # gate 激活后模型仍在调工具 = 纠错/补读回合
+                self._vl_correction_turns += 1
 
             # 本轮检索产生的注入说明文本:必须插在全部 ToolMessage 之后(工具结果
             # 需紧跟对应 tool_call),下一轮 AI 前模型即可看到新增工具名单。
@@ -587,6 +794,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
                             )
                             if real_name not in tools_used:
                                 tools_used.append(real_name)
+                            self._vl_note_real_tool(real_name, True)
                         except Exception as e:  # noqa: BLE001 — 单次失败不中断 run
                             logger.error(
                                 f"Tool '{real_name}' execution failed via "
@@ -614,6 +822,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         )
                         if tool_name not in tools_used:
                             tools_used.append(tool_name)
+                        self._vl_note_real_tool(tool_name, True)
                     except Exception as e:  # noqa: BLE001 — 单次失败不中断整个 run
                         logger.error(f"Tool '{tool_name}' execution failed: {e}")
                         tool_result = {
@@ -672,10 +881,30 @@ class MetaToolOrchestrator(AgentOrchestrator):
                     {"type": "system_message", "content": note}
                 )
 
+        final_response = (
+            get_text_content(messages[-1].content) if messages else ""
+        )
+
+        # verifier-in-loop 收尾审计:
+        #  - FINAL 标记:模型最终回复是否以 'FINAL:' 开头(不强校验,仅供统计);
+        #  - 若循环因 max_iterations 耗尽而 gate 仍未放行(无只读证据),如实打标。
+        if self.verify_loop:
+            self._vl_final_marker = str(final_response).strip().startswith("FINAL:")
+            if self._vl_gate_active and not self._vl_accepted and not self._vl_forced_done:
+                self._vl_forced_done = True
+                logger.warning(
+                    "[VERIFY-LOOP] iteration budget exhausted while gate unresolved; "
+                    "forced done (vl_forced_done=True)"
+                )
+            logger.info(
+                f"[VERIFY-LOOP] summary: gate_rounds={self._vl_gate_rounds} "
+                f"read_evidence={self._vl_read_calls} "
+                f"reminders={self._vl_no_read} corrections={self._vl_correction_turns} "
+                f"forced_done={self._vl_forced_done} final_marker={self._vl_final_marker}"
+            )
+
         return {
-            "final_response": (
-                get_text_content(messages[-1].content) if messages else ""
-            ),
+            "final_response": final_response,
             "conversation_flow": conversation_flow,
             "tools_used": tools_used,
             "tool_results": tool_results,

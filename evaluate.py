@@ -194,6 +194,7 @@ async def execute_sample(
     meta_tool_top_k=6, meta_tool_min_score=0.03, meta_warmup_top_k=None,
     retrieval="hybrid", embedding_model=None, embedding_device=None,
     hybrid_alpha=0.5, tool_dispatch="inject",
+    verify_loop=False, verify_max_rounds=3,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -227,6 +228,9 @@ async def execute_sample(
         orchestrator_kwargs["embedding_device"] = embedding_device
         orchestrator_kwargs["hybrid_alpha"] = hybrid_alpha
         orchestrator_kwargs["dispatch"] = tool_dispatch
+        # verifier-in-the-loop(验证闭环 V1):默认关,开则收尾强制只读回读核对
+        orchestrator_kwargs["verify_loop"] = verify_loop
+        orchestrator_kwargs["verify_max_rounds"] = verify_max_rounds
 
     executor = BenchmarkExecutor(
         config,
@@ -355,6 +359,23 @@ async def main():
              "full schema in the message and executed via _execute_tool(name, "
              "args), keeping the bind prefix stable for KV/prefix caches.",
     )
+    parser.add_argument(
+        "--verify_loop",
+        action="store_true",
+        help="Enable the verifier-in-the-loop completion gate (meta_tool only). "
+             "When the model claims the task is done without calling further "
+             "tools, inject a verification round: it must re-read the entities "
+             "it created/modified with read-only tools and confirm the final "
+             "state before 'FINAL:'. Self-checks use business read tools only; "
+             "verifier criteria (SQL/expected values) are never read.",
+    )
+    parser.add_argument(
+        "--verify_max_rounds",
+        type=int,
+        default=3,
+        help="Max no-evidence reminders before the completion gate force-done "
+             "(meta_tool + --verify_loop only).",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
@@ -423,6 +444,8 @@ async def main():
                 embedding_device=args.embedding_device,
                 hybrid_alpha=args.hybrid_alpha,
                 tool_dispatch=args.tool_dispatch,
+                verify_loop=args.verify_loop,
+                verify_max_rounds=args.verify_max_rounds,
             ),
             concurrency=int(args.concurrency),
         )
