@@ -1,6 +1,6 @@
 # 新会话启动提示词(复制到新对话第一句)
 
-将下面整段复制到新对话,即可让新模型无缝接手。用途:上会话(09-06/09-07)已把**工具检索/分发主线收尾** —— dispatch=exec(方案 Y)入库 `e797cc0`,email 域全量池配对已闭环(exec 53.73% ≈ inject ≈ react-oracle 基线的 90%);本会话负责**对外呈现**(README/作品集如实回填、报告口径)与后续其它模块。
+将下面整段复制到新对话,即可让新模型无缝接手。用途:上会话(09-06/09-07)已把**工具检索/分发主线收尾**(dispatch=exec 入库 e797cc0,email 域全量池配对闭环);**本会话进入 Phase 2 —— verifier-in-the-loop 验证闭环自纠正**(取代"LLM 自评是否合规"),核心约束见【本阶段关键事实与注意点】。
 
 ---
 
@@ -8,64 +8,84 @@
 你正在接手一个企业级 LLM Agent 项目(基于 ServiceNow 开源的 EnterpriseOps-Gym benchmark,本地路径 F:\Project\EnterpriseOps-Gym-main)。目标:自研"工具路由逼近 oracle 模式"的 agent 方案并持续优化,用可复现实验证明其有效性,作为面试核心项目(作品集 GitHub:enterprise-agent-control-plane)。
 
 【第一步:先读交接文档,再动手】
-1. 必读 F:\Project\EnterpriseOps-Gym-main\docs\HANDOFF.md(2026-09-07 补记版;先读它的 §0/§2/§3.3/§4.6(含 4.6.5 oracle 口径与 4.6.6 email 全量池配对)/§5/§6)
-2. 通读 docs\tool_router_design.md(路由详细设计,§7.3 = Hybrid 稠密检索)与 docs\agent_design_plan.md(总方案)
-3. 查看 .workbuddy\memory\ 日志(重点 2026-09-07、2026-09-06、2026-09-05)
+1. 必读 F:\Project\EnterpriseOps-Gym-main\docs\HANDOFF.md(2026-09-07 补记版;先读 §0/§2/§3.3/§4.6(4.6.5 oracle 口径、4.6.6 email 配对)/§5/§6)
+2. 必读 docs\agent_design_plan.md **§3.2(验证驱动的自纠正)与 §5 Phase 2(验证闭环,约 1 周,含验收标准)**、§6(实验设计与诚实标注);tool_router_design.md 按需
+3. 查看 .workbuddy\memory\ 日志(重点 2026-09-07、2026-09-06)
 
-【项目核心事实】
-- benchmark 评分看数据库终态(SQL verifier);最强模型平均成功率仅 45.9%
-- oracle 模式 = 把任务自带 selected_tools 当白名单 = "答案泄露";工具路由目标 = 从任务描述预测该子集
-- 主通道 = orchestrators/meta_tool_router.py(MetaToolOrchestrator):首轮只 bind _tool_search → LLM 显式
-  调用 → 拦截 → ToolRouter.search() → 分发执行。检索后端可插拔 retrieval=tfidf|dense|hybrid:
-  hybrid = α×稠密(bge-small-en-v1.5,min-max 归一)+(1-α)×稀疏 TF-IDF(α=0.5);dense 后端在
-  benchmark/dense_retriever.py(TextEmbedder/SentenceTransformerEmbedder/DenseIndex/get_embedder 缓存)
-- 分发双模式 --tool_dispatch inject|exec(默认 inject):inject=命中工具动态 bind(legacy,前缀逐轮变);
-  exec(方案 Y,09-06 入库 e797cc0)= bind 恒为 [_tool_search,_execute_tool],命中工具完整 schema 在
-  消息内回喂,真实工具经 _execute_tool(name,args) 统一分发 —— 真实工具名只是元工具字符串参数,任何
-  FC 服务端(OpenAI/DeepSeek 严格校验)都接受,不依赖网关宽松;前缀稳定 → KV/前缀缓存友好
-- react_router 已于 09-04 删除;ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool
-- ⚠️ 运行环境:必须用项目 .\.venv\Scripts\python.exe(Python 3.14.3,含 langchain_core);本地无 conf/llm(key)
-  与容器 → 端到端需服务端(RUN_GUIDE.md);numpy 需 ≥2.3(cp314);dense/hybrid 依赖 `uv sync --extra dense`
-  (非包仓库 [tool.uv] package=false);sentence-transformers/torch 建议清华镜像 + HF_ENDPOINT=https://hf-mirror.com
+【本阶段课题 = verifier-in-the-loop(Phase 2),先理解评分机制再设计】
+- 评分只认数据库/SQL 终态:benchmark/verifier.py 的 VerifierEngine 三类判据 ——
+  ① database_state(SQL query + expected_value + comparison_type,占绝大多数)
+  ② response_check(LLM-as-judge 比 SQL 结果与模型回复)
+  ③ tool_execution(检查是否调过指定工具)。
+  verifiers 是**人类专家在造数据集时离线编写**的(如 CSM 一条:name=update_entitlement,
+  query=SELECT coverage_hours FROM entitlement WHERE entitlement_id=73, expected=h24x7)。
+- 判据在 executor 层评分时才读:executor._run_verifiers(executor.py L471-533)拿 task_result
+  后逐条执行,overall_success = 全部 passed;**执行中的 agent 从头到尾看不到 verifiers**。
+- ⚠️ **用户注意点(本会话最重要约束)**:验证指标由人类专家设定、**任务不会提前告知 agent**。
+  agent 运行时只拥有 system_prompt(域政策,如 CSM Agent Policy)+ user_prompt(任务描述),
+  不知道也不应知道 verifier 的 SQL/expected_value。
+- ⚠️ **更尖锐的代码事实**:executor 把完整 BenchmarkConfig(含 verifiers 字段,models.py L64)
+  传给了 orchestrator(base.py L29 self.config=config)→ **orchestrator 代码上能触达
+  self.config.verifiers** —— 设计时"把验收清单注入 prompt/自查"是极其自然的诱惑,但这是
+  比 selected_tools 泄露更重的判据泄露(不仅给工具名,还给答案值),**绝对禁止**。
+- **失败模式(为什么不能靠模型自评)**:agent 说"完成"就收工,从不回查终态 → 半途而废型失败
+  (design_plan §3.2 痛点);LLM 自评"是否合规"不可靠(自说自话 + 无终态证据)。
+  verifier-in-loop 的价值 = 用**外部确定性检查(数据库真实状态)**替换模型内省式自评。
 
-【已完成(截至 09-07,功能 HEAD = e797cc0;链:e797cc0 ← 435c530 ← 2449049 ← 21ee47b ← b66e82f ← 086bcea
-← f8820d5 ← 25068d1 ← 6c308bb ← …)】
-- 执行循环鲁棒化 + 意图级检索(9a04a3d/2c2b62f);MetaToolOrchestrator(7edee85);09-04 dense/hybrid(6c308bb,
-  meta_tool e2e 32.35% vs react-oracle 30.39% 非显著 → 用户决策移除 react_router);单测 61/61
-  (test_tool_router 33 + test_meta_tool_router 17 + test_dense_retriever 11;tests/ 不入库)
-- 服务端真池 hybrid 离线(meta_sim 31.9% vs tfidf 27.5%,zero% 6→0);五个运维 hotfix(25068d1/f8820d5/
-  086bcea/21ee47b/2449049)
-- **09-05:hybrid e2e(hr/oracle)100 runs / 31.0% + oracle 口径红线**:oracle 模式 executor(L330-350)
-  把池过滤成 selected_tools GT 白名单 → 检索对成功率无区分度 → 31.0% vs 32.35% 是噪声,不是增益也不是回退
-- **09-06:dispatch=exec(方案 Y)入库 e797cc0**:固定 bind 保前缀缓存;analyze_meta_runs 行级
-  meta_tool_dispatch(老结果缺省归 inject);方案 X(裸真实工具名直调)冒烟可行但依赖网关宽松,弃用
-- **09-07:email 域全量池配对已闭环(§4.6.6)**:67 configs(email/oracle split,pop selected_tools/
-  restricted_tools),compute_score.py 聚合 → dispatch=exec+hybrid **53.73%/71.47%**(2 error)≈
-  dispatch=inject(同池对照,用户实测差异很小)≈ react-oracle 基线 59.70%/76.39% 的 90%。⚠️ 限定:
-  仅 email 域单 run 配对,域间不可比(hr 全量池仅 19-24%);2 error 文件未归类
-- docs/HANDOFF.md(09-07 版 §4.6.6)与 memory 已回填
+【本阶段要解决的设计问题(先与用户逐项对齐,别急着写代码)】
+1. 自查信号源:agent 用什么看终态?首选**现有 MCP 只读工具**(list/get/search 查询类,
+   检索+工具治理已铺路);慎用 /api/sql-runner(那是 verifier 的 SQL 通道,agent 直连 =
+   借用评分基础设施,需讨论是否可接受)。哪些域/任务的只读工具能覆盖自查需求?
+2. 自查 SQL 谁写:模板化只读 SQL(design_plan §3.2 明确:不依赖 LLM 写 SQL,否则引入新错误源)
+   + 白名单(只允许 SELECT/只读,禁止任何 DML;执行前校验)。
+3. 自查标准从哪来(不读 verifiers 的前提下):从 user_prompt 显式目标 + 域政策推导
+   ("把 case INC123 状态改为 open" → 自查 = 回查该 case 的 state);域内隐含验收
+   (专家额外查的字段,任务描述没写)无法推导 → 只能靠域表结构/政策惯例自查,做不到如实标注。
+4. 触发点:关键写操作后(建/改/删)即查 vs 宣布完成前终态核对 vs 两者?与现有 meta_tool
+   的 exec-loop 在哪一层插(checkpoint 在 orchestrator 内 vs executor 层)?
+5. "完成"判定:agent 自查通过才允许收工(自报 done 前强制一轮核对)?run 内重试预算?
+   注意区分已有机制:execute_sample max_num_attempts=5 是 **error 重试**(整个 sample 重跑),
+   verifier-in-loop 是 **run 内判定失败→纠错→续跑**,两者不同,别混。
+6. 失败信号边界:verifier pass/fail 若回喂 agent = 评分者信息参与执行。设计文档 §6.5 认为
+   "verifier 公开、执行中自查合理,但要写明方法"。建议从严:agent 自查全部走自己的只读通道,
+   **不读取 verifiers 字段、不把 verifier 的 expected/SQL 当纠错信号**;若确需 verifier
+   反馈做重试,只允许二元 pass/fail 且实验记录里如实写明(面试被问不翻车)。
+7. 对照实验:baseline(现 meta_tool + hybrid + dispatch=exec,email 域 53.73%)vs +验证闭环;
+   同域(建议 email/teams,写操作多、成功率基线高)同 split 同模型同 concurrency,单变量;
+   成功判据 = compute_score.py 的 Avg Success/Verifier Pass 提升 + 半途而废类失败占比下降;
+   顺带录 2-3 个"自查纠错"演示样例(Phase 2 验收要求,简历素材)。
 
-【本次会话的核心任务(按 ROI,与用户对齐再动)】
-1. 【P0】对外呈现 / README / 作品集(enterprise-agent-control-plane)如实回填:Meta-Tool 主通道 + hybrid
-   检索 + dispatch=exec 三层机制;数字分层并注明口径 —— ① oracle e2e 31.0%(无区分度/噪声) ② email 全量池
-   配对 53.73%(单域限定) ③ 离线下界 meta_sim 31.9%;cache_hits=0 如实说明;测试 61/61
-2. 【P1】服务端离线参数扫描(零 LLM 成本):eval_router.py --meta_sim 扫 retrieval × alpha ∈ {0.3,0.5,0.7}
-   × top_k,做调参依据与面试消融(仅当仍需调参时)
-3. 【P1】分类 email 卷 2 个 error 文件(_execute_tool 未知名/参数错 vs 超时/网络)→ 判断 exec 提示是否需修
-4. 【P1】若需跨域泛化证据:hr/csm 域全量池配对(成本换严谨,非必须;报告只做同域)
-5. 【P2】_tool_search 参数调优(top_k/min_score/缓存阈值)触发率统计;bge 选型与 query_instruction 实验
-6. 若用户推进其它模块(如 Phase-2 记忆/自纠正),按 agent_design_plan.md 进入新主线
+【项目核心事实(继承,勿忘)】
+- 主通道 = orchestrators/meta_tool_router.py:检索可插拔 retrieval=tfidf|dense|hybrid(α=0.5,
+  bge-small-en-v1.5);分发 --tool_dispatch inject|exec(默认 inject;exec = bind 恒为
+  [_tool_search,_execute_tool],真实工具经 _execute_tool 统一分发,保前缀缓存,e797cc0)
+- ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool;react_router 已删
+- 工具路由红线:selected_tools 只用于离线评估,执行时路由器只输入 user_prompt/system_prompt
+- oracle 口径无区分度(executor L330-350 过滤 GT 白名单);email 域全量池配对(§4.6.6):
+  exec 53.73% ≈ inject ≈ react-oracle 59.70% 的 90%,仅 email 域单 run,域间不可比
+- 单测 61/61(test_tool_router 33 + test_meta_tool_router 17 + test_dense_retriever 11,
+  tests/ 不入库);功能 HEAD = e797cc0(a46ddab = docs 回填)
+- ⚠️ 运行环境:必须用项目 .\.venv\Scripts\python.exe(Python 3.14.3,含 langchain_core);本地
+  无 conf/llm(key)与容器 → 端到端需服务端(RUN_GUIDE.md);numpy ≥2.3(cp314);dense/hybrid
+  依赖 `uv sync --extra dense`;HF_ENDPOINT=https://hf-mirror.com
+
+【已完成(截至 09-07,勿重复劳动)】
+- 工具检索/分发主线收尾:意图级检索(2c2b62f)→ MetaToolOrchestrator(7edee85)→ dense/hybrid
+  + react_router 移除(6c308bb)→ dispatch=exec 方案 Y(e797cc0)→ email 域全量池配对闭环
+  (a46ddab 回填 §4.6.6);oracle e2e 100 runs/31.0% 与口径红线已归档(435c530)
+- verifier 引擎本身已存在且可直接复用:VerifierEngine(_run_verifiers 通道)的 SQL 执行能力;
+  evaluate.py --hf_dataset/--configs_folder 全量池派生脚本、compute_score.py 聚合均已就绪
 
 【红线,不可违反】
-- selected_tools 只能用于离线评估路由质量,执行时路由器只输入 user_prompt/system_prompt,禁止读取(答案泄露)
-- 对照实验必须同模型、同 split、同 concurrency、同池;报告写明口径(retrieval 后端 + alpha + dispatch + 域限定)
-- _tool_search 拦截只打分/返回/注入可见集,绝不自动执行真实工具(写副作用由模型显式调用)
-- dense/hybrid 缺依赖时显式 ImportError,绝不静默降级成 tfidf 而让实验口径失真
-- 项目在 Windows(F 盘),git rm 有连带删除同目录文件的坑(用普通 rm + git add -A);文件操作后确认落盘
+- verifier 判据(verifiers 字段的 SQL/expected_value/description)禁止注入 prompt、禁止作为
+  自查依据、禁止当纠错信号 —— 与 selected_tools 同级甚至更重的答案泄露(§6.5 灰色地带从严处理)
+- 自查 SQL 只读:任何 DML/绕过只读白名单一律拦截;agent 自写 SQL 须过校验器
+- 对照实验同模型/同 split/同 concurrency/同池;报告写明口径与 verifier 信息使用边界
+- 项目在 Windows(F 盘),git rm 有连带删除同目录文件的坑;文件操作后确认落盘
 ```
 
 ---
 
 **使用说明**:
 - 粘贴上面代码块整段内容作为新对话的第一条消息即可。
-- 接手后建议先只读文件 + 跑单测(零成本:`./.venv/Scripts/python.exe -m unittest discover -s tests`),再与用户对齐下一步(推荐先做 §6 #3 对外呈现,或用户指定的其它模块)。
+- 接手后建议:先读文件 + 跑单测(零成本),再与用户**逐项对齐【设计问题】1-7**(尤其自查信号源与失败信号边界),再动代码;实现/实验全程记入 .workbuddy\memory\ 并按惯例回填 HANDOFF。

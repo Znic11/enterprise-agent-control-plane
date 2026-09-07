@@ -289,6 +289,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 | 7 | 【P2】bge 选型与 query 指令实验:bge-small vs bge-base vs e5;`query_instruction` 是否开启(当前空串)对域内检索的影响 | #4 环境 | 检索质量上限 |
 | 8 | 【P2】稠密通道噪声诊断:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #4 数据 | 误报控制 |
 | 9 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #4 数据 | 即得 recall 增益 |
+| 10 | **【P0,Phase 2 启动】verifier-in-the-loop 验证闭环自纠正**:设计/实现指引见 docs/NEXT_SESSION_PROMPT.md(09-07 版)与 agent_design_plan §3.2/§5 Phase 2。⚠️ 判据由人类专家离线编写、**不随任务告知 agent**;且 orchestrator 代码上可触达 self.config.verifiers(executor L409 传全量 config)→ 禁止注入 prompt/自查依据/纠错信号,自查只走只读通道、标准从任务描述+域政策推导 | 工具主线已收尾 | 取代 LLM 自评合规;Phase 2 首块 |
 
 ✅ 已完成(2026-08-31~09-07):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(本节 #1/§4.6.6)**。
 
