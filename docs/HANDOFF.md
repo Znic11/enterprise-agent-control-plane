@@ -1,16 +1,16 @@
 # EnterpriseOps-Gym 项目交接文档(Handoff)
 
-> 交接日期:2026-09-04 · 交接人:上一会话 · 接收人:新会话模型(用户将开新对话"重新优化方案")
-> 阅读顺序:本文档 → `docs/tool_router_design.md`(路由详细设计,Phase-1 权威)→ `docs/agent_design_plan.md`(总方案)→ `.workbuddy/memory/`(按日日志,09-04/09-05 最新)
-> 版本说明:本版取代 2026-09-03 版 HANDOFF(其"react_router 双轨待对照 / TF-IDF 暂不换 / Meta-Tool diff 未提交"等描述已被 09-04 会话推翻:react_router 已移除、检索后端已 hybrid 化、diff 已提交);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
+> 交接日期:2026-09-07 · 交接人:上一会话 · 接收人:新会话模型(对外呈现/新模块)
+> 阅读顺序:本文档 → `docs/tool_router_design.md`(路由详细设计,Phase-1 权威)→ `docs/agent_design_plan.md`(总方案)→ `.workbuddy/memory/`(按日日志,09-07/09-06 最新)
+> 版本说明:本版在 2026-09-03 版基础上由 09-04(dense/hybrid、react_router 移除)、09-05(oracle 口径发现)、09-06(dispatch=exec)、09-07(email 全量池配对)会话持续补记;**工具检索/分发主线已收尾**,当前重心 = 对外呈现(§6 #3);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
 
 ---
 
 ## ⚡ 0. 三句话摘要(先读这里)
 
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研"企业级 LLM Agent",核心卖点 = 用**检索+LLM 的工具路由逼近 oracle 模式**(把"答案泄露"变成"能力预测"),以可复现实验证明有效性,作为面试核心项目;代码同步沉淀在 GitHub 作品集 `enterprise-agent-control-plane`(= 本仓库 origin)。
-2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);单测 **55/55 通过**(§2),提交状态见 §3.3/§4.6。
-3. **hybrid e2e 已跑出(100 runs / 31.0%),但 oracle 口径对检索无区分度(09-05 关键发现)**:用户首轮小样本端到端 meta_tool 32.35% vs react-oracle 30.39%(非显著);hybrid 真池离线数字已出(§4.6.3:meta_sim final_recall 31.9% vs tfidf 27.5%、zero% 6%→0);端到端 `--retrieval hybrid` 100 runs 成功 31(31.0%,hr/oracle)。**口径红线**:oracle 模式 executor 把可用池过滤成 selected_tools(GT)白名单 → `_tool_search` 只在"答案池"里检索,检索后端对成功率**无区分度** → 31.0% vs 32.35% 的差异 = 单次运行噪声,不能当 hybrid 回退也不能当增益。hybrid 端到端有效性的真正证据 = **带干扰工具的 split(非 oracle)下 tfidf vs hybrid AB 对照**(§4.6.5/§6 #1)。
+2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);09-06 新增 **dispatch=exec(方案 Y)**(固定 bind 保前缀缓存,`e797cc0`);单测 **61/61 通过**(§2),提交状态见 §3.3/§4.6。
+3. **hybrid e2e 已跑出(100 runs / 31.0%),oracle 口径对检索无区分度(09-05 关键发现)**:用户首轮小样本端到端 meta_tool 32.35% vs react-oracle 30.39%(非显著);hybrid 真池离线数字已出(§4.6.3:meta_sim final_recall 31.9% vs tfidf 27.5%、zero% 6%→0);端到端 `--retrieval hybrid` 100 runs 成功 31(31.0%,hr/oracle)。**口径红线**:oracle 模式 executor 把可用池过滤成 selected_tools(GT)白名单 → `_tool_search` 只在"答案池"里检索,检索后端对成功率**无区分度** → 31.0% vs 32.35% 的差异 = 单次运行噪声。hybrid 有效性的真正证据 = **带干扰工具的全量池 AB 对照(§4.6.6)**:09-07 email 域 67 tasks 配对已闭环 —— **exec/hybrid 53.73% ≈ inject/hybrid(同池,差异很小)≈ react-oracle 基线 59.70% 的 90%**,工具检索/分发主线收尾;dispatch=exec(方案 Y,固定 bind 保前缀缓存)已入库 `e797cc0`。
 
 ---
 
@@ -30,7 +30,7 @@
 | 事项 | 事实 |
 |---|---|
 | **真实 Python 环境** | 项目 `.venv`(Python 3.14.3,含 langchain_core 等全部依赖)。⚠️ 受管 python 3.13 与系统 anaconda **均无 langchain_core**;凡 import orchestrators / benchmark.llm_client 的代码只能用 `.\.venv\Scripts\python.exe` |
-| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **55 passed**(test_tool_router 33 + test_meta_tool_router 11 + test_dense_retriever 11;test_react_router 7 已随 react_router 移除);路由模块本身纯 stdlib,任意 py3 可跑,但 dense 相关测试需 numpy |
+| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **61 passed**(test_tool_router 33 + test_meta_tool_router 17 + test_dense_retriever 11;test_react_router 7 已随 react_router 移除);路由模块本身纯 stdlib,任意 py3 可跑,但 dense 相关测试需 numpy |
 | **numpy / 3.14 坑** | `.venv` = Python 3.14.3 → 必须 numpy ≥ 2.3(cp314 wheel;numpy 2.0.2 无 cp314 会卡源码编译)。装法:`uv pip install --python .venv/Scripts/python.exe "numpy>=2.3" -i https://pypi.tuna.tsinghua.edu.cn/simple`(官方 PyPI 慢/易中断;中断会留下缺 `__init__.py` 的假 numpy —— 先 `rm -rf .venv/Lib/site-packages/numpy` 再重装);sentence-transformers/torch 同理建议 `-i` 清华镜像 + 设 `HF_ENDPOINT=https://hf-mirror.com`(首次拉 bge 模型) |
 | **LLM key / 容器** | 本地 `conf/llm/` 不存在 → 端到端被 key 阻塞;容器/udocker 全套指令见 `RUN_GUIDE.md`(服务端已验证;本地 docker daemon 曾静默失败) |
 | **真实工具池** | `tools_dump.json`(仓库根,512 原始条目含 `_domain`,按 (name,_domain) 去重后 458)**已入库**(2c2b62f);⚠️ MCP `tools/list` 真实 schema 字段是 `inputSchema`(驼峰),dump/测试用 `input_schema`(小写)——`build_tool_signature` 已双兼容 |
@@ -56,7 +56,7 @@
 - full_cov 坑:32/160 GT 引用其他域容器工具(不可达),须按 reachable 口径排除(999c15d),否则 full_cov=0 误报。
 
 ### 3.3 相关 commit 链(main,新→旧)
-`086bcea`(fix(deps): 补声明 nest_asyncio/aiohttp,evaluate 运行时依赖缺口) ← `f8820d5`(fix(eval): --analyze_meta_runs 短路纯聚合 + ST 维度查询 FutureWarning 兼容) ← `25068d1`(fix(packaging): 显式 setuptools 包发现,修 pip install -e flat-layout 报错) ← `6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit 01acad1) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
+`e797cc0`(09-06 feat(meta_tool): dispatch=exec 固定 bind 模式/方案 Y + --tool_dispatch + analyze dispatch 维度;§4.6.6) ← `435c530`(docs: 回填 09-05 hybrid e2e 数字与 oracle 口径发现 §4.6.5) ← `2449049`(fix(llm_client): provider 缺依赖报错带 extra 安装提示) ← `21ee47b`(fix(evaluate): configs_folder 无 *.json 显式报错) ← `b66e82f`(docs: 服务端真池 hybrid 数字与运维 hotfix) ← `086bcea`(fix(deps): 补声明 nest_asyncio/aiohttp) ← `f8820d5`(fix(eval): analyze_meta_runs 短路纯聚合 + ST 维度 FutureWarning) ← `25068d1`(fix(packaging): 显式 setuptools 包发现) ← `6c308bb`(09-04 feat(retrieval): dense/hybrid 检索后端 + 移除 react_router,§4.6;文档回填为紧随其后的 docs commit 01acad1) ← `67714f6`(docs: Meta-Tool 模式定稿回填) ← `7edee85`(feat(meta-tool): MetaToolOrchestrator + eval 接线/离线指标) ← `2c2b62f`(feat(router): intent-level retrieval ToolRouter.search + exec-loop 触发点 A/C;含 react_router、base.py、docs、tools_dump.json 入库) ← `9a04a3d`(fix(orchestrators): exec-loop robustness —— 工具失败不再中断 run) ← `6386af2`(--candidate_k 解耦 LLM 候选宽度与 top_k 保底) ← `7323b1c`(rerank_mode=union,recall ≥ 粗筛) ← `6052625`(k_candidate/k_final 解耦,粗筛不再被候选池截断) ← `94e979c`(RouteResult.candidate_names+ROUTER_PROMPT 6-20 引导) ← `0690b43`(dump 合并键 name,_domain) ← `999c15d`(reachable-GT 口径) ← `74e7207`(归因脚本修复) ← `0d31b51/2d258f2`(dump/归因脚本) ← `eee7bc5`(batch_route 并发)。
 
 ---
 
@@ -246,11 +246,27 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
   2. 端到端需在**带干扰工具的 split**(上游 `+5_tools`/`+10_tools`/`+20_tools`,或去掉 selected_tools 让 executor 用全量域池 ~89 工具)下做 tfidf vs hybrid AB 对照——此时 `_tool_search` 真在"相关 vs 干扰"里挑,检索质量才影响成功率。命令建议:`evaluate.py --hf_dataset ServiceNow-AI/EnterpriseOps-Gym --mode +5_tools --domain hr --orchestrator meta_tool --retrieval tfidf|hybrid --num_runs 2`,同 split/同模型取均值;先 `from datasets import get_dataset_config_names; get_dataset_config_names('ServiceNow-AI/EnterpriseOps-Gym')` 列出可用 split。
 - **cache_hits=0 的说明**:LLM 生成的 query 串在同任务内几乎不重复 → per-task LRU 缓存实为摆设(558 次检索零命中);不伤性能可留着,汇报时如实说明。
 
+### 4.6.6 09-07 补记:email 域全量池配对实验 + dispatch=exec(方案 Y)落地(工具检索/分发主线已收尾)
+
+- **dispatch 双模式入库(commit `e797cc0`,09-06)**:动态注入命中工具会逐轮改变 bind 集、破坏长上下文 KV/前缀缓存 → `MetaToolOrchestrator` 新增 `dispatch="inject|exec"`(`evaluate.py --tool_dispatch`,默认 inject 不破坏旧口径)。exec 模式 bind 集**恒为 `[_tool_search, _execute_tool]`**,`_tool_search` 命中时在消息内回喂命中工具完整 input_schema(仅首次全量),真实工具经 `_execute_tool(name, args)` 由 orchestrator 统一分发执行 —— 真实工具名只是元工具的字符串参数,**任何 FC 服务端(含 OpenAI/DeepSeek 严格校验)都接受**,不依赖网关对 bind 外名字宽松。**方案 X(模型裸输出真实工具名直调、不改 bind 集)冒烟证明当前网关不校验、可行,但可行性依赖网关行为,弃用**;方案 Y 即入库形态。exec 零命中兜底 = 列全池名单引导点名(不 bind 全池,保前缀稳定);`eval_router.py --analyze_meta_runs` 已按行记录 `meta_tool_dispatch`(老结果缺省归 inject)。单测 55→**61**(TestExecDispatchMode 6 例)。
+- **email 域全量池配对(服务端 09-07,67 configs = email/oracle split 全量,pop 顶层 selected_tools/restricted_tools 后 evaluate,`compute_score.py` 聚合,deepseek-v4-flash)**:
+
+| 卷 | 工具口径 | Avg Success | Avg Verifier Pass | Errors |
+|---|---|---|---|---|
+| dispatch=**exec** + hybrid | 全量池(email 全工具) | **53.73%** | **71.47%** | 2 |
+| dispatch=**inject** + hybrid(同池对照) | 全量池 | 用户实测与 exec **差异很小**(具体数字未归档) | — | — |
+| react + oracle(基线) | GT 白名单(工具在手边) | 59.70% | 76.39% | 0 |
+
+- **解读(汇报口径,⚠️ 勿越界)**:
+  1. **exec ≈ inject(同池配对)**:exec 分发不劣于旧动态 bind → 前缀缓存友好(成本侧收益)可以"白拿",这是 dispatch=exec 落地的核心论据;
+  2. **全量池检索 ≈ oracle 基线 90%**(53.73/59.70):exec+meta_tool 在"从干扰工具里挑"的难度下仍接近"答案在手边"的 react-oracle → 检索+分发未显著损失成功率。与 react 表的 6pp 差 = **全量池 vs 白名单的难度差,不是误差**,不可当"方案落后基线"讲;
+  3. **限定条件**:仅 email 域、67 tasks、单 run 配对;**域间绝对数不可比**(hr 域全量池仅 19-24% vs email 54% —— 域难度/池大小差异),报告只做同域配对,跨域比较会被追问;2 个 error 文件未归类(若集中于 `_execute_tool` 未知名/参数错 → exec 提示问题,超时/网络则忽略)。
+
 ---
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
 
-1. **【已落地】工具调用主通道 = Meta-Tool + Hybrid 检索**:`MetaToolOrchestrator` 已注册,`_tool_search` 走 `retrieval=hybrid`(稠密 bge + 稀疏 TF-IDF,alpha=0.5);react_router 已移除(§4.6)。真池离线 meta_sim 已量化(31.9% vs tfidf 27.5%,zero% 归零);e2e hybrid 100 runs / 31.0% 已跑出(§4.6.5)——但 **oracle 口径下 executor 把池过滤成 GT 白名单,检索对成功率无区分度**,31.0% vs 32.35% 是噪声;hybrid 端到端有效性的真正验证 = **带干扰工具的 split(非 oracle)下 tfidf vs hybrid AB 对照**(§6 #1)。
+1. **【已收尾】工具调用主通道 = Meta-Tool + Hybrid 检索 + dispatch=exec 分发**:`MetaToolOrchestrator` 已注册,`_tool_search` 走 `retrieval=hybrid`(稠密 bge + 稀疏 TF-IDF,alpha=0.5);react_router 已移除(§4.6);dispatch=exec(方案 Y,固定 bind 保前缀缓存)已入库 `e797cc0`(§4.6.6)。**oracle 口径无区分度已证**(executor 过滤 GT 白名单,§4.6.5),email 域全量池配对已闭环(§4.6.6:exec/hybrid 53.73% ≈ inject/同池,≈ react-oracle 基线 59.70% 的 90%)。剩余:hr/csm 等域未做配对(报告只做同域,跨域不可比);2 个 error 文件未归类。
 2. **【待决策】LOOKUP_FLOOR 默认值**:0.08 → 0.15?(真实池扫描 0.15 显著提 recall;暴露数 20→30)。Meta-Tool 的 `boost_lookup` 默认 False(是否默认开待数据)。
 3. **【待调参】hybrid 参数族 + 粗筛路径观察**:服务端真池显示 route 粗筛 hybrid(38.8%)略逊 tfidf(42.5%),而 meta_sim(主通道)全面占优 → 若将来启用 `warmup_top_k`(route 预热)建议 route 用 tfidf、`_tool_search` 用 hybrid,或降低 alpha;可先用 `eval_router.py --meta_sim` 扫 alpha∈{0.3,0.5,0.7}。
 4. **【初值未调,已有默认+仿真诊断】** `_tool_search` top_k=6/min_score=0.03/缓存 64/零命中兜底 3;`--meta_sim` 已能离线诊断检索器覆盖。
@@ -260,20 +276,21 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 
 ---
 
-## 6. 下一步候选(按 ROI;2026-09-04 后,hybrid 检索已落地、react_router 已移除)
+## 6. 下一步候选(按 ROI;2026-09-07 后,工具检索/分发主线已收尾,重心转向对外呈现)
 
 | # | 任务 | 前置 | 状态/价值 |
 |---|---|---|---|
-| 1 | **【P0】干扰工具 split 下 tfidf vs hybrid AB 对照(hybrid e2e 有效性的最终证据)**:oracle 口径已证明无区分度(§4.6.5)→ 跑 `evaluate.py --hf_dataset ServiceNow-AI/EnterpriseOps-Gym --mode +5_tools/+10_tools/+20_tools --domain <d> --orchestrator meta_tool --retrieval tfidf\|hybrid --num_runs 2`(或去掉 selected_tools 用全量域池 ~89 工具);同 split/同模型取均值并排对比;先 `get_dataset_config_names('ServiceNow-AI/EnterpriseOps-Gym')` 确认 split 名 | 服务器;依赖已装齐 | **hybrid 端到端增益量化(当前唯一剩余空白)** |
+| 1 | **【✅ 已完成 09-07】email 域全量池配对(hybrid e2e 有效性的最终证据)**:67 configs = email/oracle split,pop 顶层 selected_tools/restricted_tools → `evaluate.py --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec|inject` 同池对照 + react-oracle 基线,`compute_score.py` 聚合 → **exec 53.73% ≈ inject(同池,差异很小)≈ react-oracle 59.70% × 90%**(§4.6.6)。跨域如需泛化证据,可选跑 hr/csm 配对(成本换严谨,非必须) | 已完成 | **工具主线收尾依据** |
 | 2 | **【✅ 已完成 09-05】hybrid 端到端 + analyze**:`evaluate.py --retrieval hybrid`(hr/oracle)100 runs → **31.0%**;行为指标 search_calls 561 / zero_hits 3 / hits_avg 5.62 / fallback 0 / cache_hits 0 | — | 数字与 oracle 口径发现已回填 §4.6.5 |
-| 3 | **【P1】离线参数扫描(服务端,零 LLM 成本)**:`eval_router.py --meta_sim` 扫 retrieval ∈ {tfidf,dense,hybrid} × alpha ∈ {0.3,0.5,0.7} × top_k,产出 recall/precision 对照表 | 服务器 | 调参依据 + 面试消融 |
-| 4 | **【P1】README / 作品集如实回填**:标注 Meta-Tool 主通道 + hybrid 检索后端(机制、alpha、55/55、离线下界数字、e2e 数字需注明 oracle 口径与噪声结论) | 无 | 面试呈现(防深挖翻车) |
-| 5 | **【P1】`_tool_search` 参数调优**:top_k/min_score/缓存/零命中兜底阈值的触发率与误触发率统计 | #1 数据 | 稳定性 + 延迟 |
-| 6 | **【P2】bge 选型与 query 指令实验**:bge-small vs bge-base vs e5;`query_instruction` 是否开启(当前空串)对域内检索的影响 | #3 环境 | 检索质量上限 |
-| 7 | **【P2】稠密通道噪声诊断**:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #3 数据 | 误报控制 |
-| 8 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #1 数据 | 即得 recall 增益 |
+| 3 | **【P0】对外呈现 / README / 作品集如实回填**:标注 Meta-Tool 主通道 + hybrid 检索后端 + dispatch=exec;数字分层写(oracle 口径 31.0% 与噪声结论 / email 全量池配对 53.73% / 离线下界 31.9%),一律注明口径与单域限定 | 无 | 面试呈现(防深挖翻车) |
+| 4 | 【P1】离线参数扫描(服务端,零 LLM 成本):`eval_router.py --meta_sim` 扫 retrieval ∈ {tfidf,dense,hybrid} × alpha ∈ {0.3,0.5,0.7} × top_k,产出 recall/precision 对照表 | 服务器 | 调参依据 + 面试消融 |
+| 5 | 【P1】`_tool_search` 参数调优:top_k/min_score/缓存/零命中兜底阈值的触发率与误触发率统计 | 服务器 | 稳定性 + 延迟 |
+| 6 | 【P1】分类 email 全量池卷 2 个 error 文件(`_execute_tool` 未知名/参数错 vs 超时/网络) | §4.6.6 产物 | exec 提示是否需修 |
+| 7 | 【P2】bge 选型与 query 指令实验:bge-small vs bge-base vs e5;`query_instruction` 是否开启(当前空串)对域内检索的影响 | #4 环境 | 检索质量上限 |
+| 8 | 【P2】稠密通道噪声诊断:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #4 数据 | 误报控制 |
+| 9 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #4 数据 | 即得 recall 增益 |
 
-✅ 已完成(2026-08-31~09-05):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85,51/51);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb,55/55 + tfidf 冒烟零回归)**;tests/test_dense_retriever.py 11 例真跑通过(numpy 2.5.2 修复后);服务端真池 hybrid 离线数字已回填 §4.6.3(meta_sim 31.9%);三个运维 hotfix(25068d1 打包 / f8820d5 analyze 短路 / 086bcea 依赖声明);**服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现已回填 §4.6.5(09-05)**。
+✅ 已完成(2026-08-31~09-07):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(本节 #1/§4.6.6)**。
 
 长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正 → 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
 
@@ -286,7 +303,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 - 评估:`eval_router.py`(离线,`--tools tools_dump.json` 真实池;`--retrieval auto|tfidf|dense|hybrid`;`--meta_sim`)、`evaluate.py`(端到端;ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool;`--retrieval` 默认 hybrid)、`compute_score.py`、`RUN_GUIDE.md`(服务端容器/评测全流程)、`scripts/analyze_router_misses.py`(漏检归因)
 - 数据:`tools_dump.json`(512→458,_domain 分域)、`gym_dbs.zip`
 - 作品集:GitHub `enterprise-agent-control-plane`(README:实现状态如实标注)
-- 记忆:`.workbuddy/memory/2026-09-04.md`(本会话:dense/hybrid 落地 + numpy 坑 + e2e 决策)、09-03(ToolLLM 调研+意图检索落地+TF-IDF 结论)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
+- 记忆:`.workbuddy/memory/2026-09-07.md`(本会话:email 全量池配对 + 工具主线收尾)、2026-09-06(dispatch=exec 落地 e797cc0 + X/Y 分析)、2026-09-05(全量池方案/oracle 口径)、09-04(dense/hybrid 落地)、09-03(ToolLLM 调研+意图检索落地)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
 
 ---
-*本文档由 2026-09-05 会话补记(hybrid 端到端 100 runs / 31.0% + oracle 口径发现 §4.6.5;HEAD = 2449049),供新会话无缝接手。实现状态均已如实标注;hybrid 端到端有效性的最终验证 = 干扰工具 split 的 tfidf vs hybrid AB 对照(§6 #1)。*
+*本文档由 2026-09-07 会话补记(email 域全量池配对结论 + dispatch=exec 方案 Y;HEAD = e797cc0,§4.6.6),供新会话无缝接手。实现状态均已如实标注;工具检索/分发主线已收尾,下一步重心 = 对外呈现/README 回填(§6 #3)。*
