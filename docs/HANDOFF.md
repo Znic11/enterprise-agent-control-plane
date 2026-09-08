@@ -1,17 +1,18 @@
 # EnterpriseOps-Gym 项目交接文档(Handoff)
 
-> 交接日期:2026-09-07 · 交接人:上一会话 · 接收人:新会话模型(对外呈现/新模块)
-> 阅读顺序:本文档 → `docs/tool_router_design.md`(路由详细设计,Phase-1 权威)→ `docs/agent_design_plan.md`(总方案)→ `.workbuddy/memory/`(按日日志,09-07/09-06 最新)
-> 版本说明:本版在 2026-09-03 版基础上由 09-04(dense/hybrid、react_router 移除)、09-05(oracle 口径发现)、09-06(dispatch=exec)、09-07(email 全量池配对 + **Phase 2 verifier-in-the-loop V1 落地与配对结果,§4.6.7**)会话持续补记;工具检索/分发主线已收尾,Phase 2 验证闭环 V1 已落地(方向证据,未显著);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
+> 交接日期:2026-09-08 · 交接人:上一会话 · 接收人:新会话模型(对外呈现/新模块)
+> 阅读顺序:本文档 → `docs/memory_design.md`(Phase 3 记忆 V1 设计权威,09-08)→ `docs/tool_router_design.md`(路由详细设计,Phase-1 权威)→ `docs/agent_design_plan.md`(总方案)→ `.workbuddy/memory/`(按日日志,09-08/09-07 最新)
+> 版本说明:本版在 2026-09-03 版基础上由 09-04(dense/hybrid、react_router 移除)、09-05(oracle 口径发现)、09-06(dispatch=exec)、09-07(email 全量池配对 + **Phase 2 verifier-in-the-loop V1 落地与配对结果,§4.6.7**)、09-08(Phase 2 第二卷佐证收口 + **Phase 3 分层记忆 V1 设计定稿与落地,§4.7**)会话持续补记;工具检索/分发主线已收尾,Phase 2 验证闭环 V1 已落地(方向证据,两卷合并仍未显著),Phase 3 分层记忆 V1 已入库(默认关,待服务端对照实验);旧版可在 git 历史取回。历史执行记录与新进展的关系见 §3.3 commit 链。
 
 ---
 
 ## ⚡ 0. 三句话摘要(先读这里)
 
 1. **目标**:在 ServiceNow 开源的 EnterpriseOps-Gym 基准上自研"企业级 LLM Agent",核心卖点 = 用**检索+LLM 的工具路由逼近 oracle 模式**(把"答案泄露"变成"能力预测"),以可复现实验证明有效性,作为面试核心项目;代码同步沉淀在 GitHub 作品集 `enterprise-agent-control-plane`(= 本仓库 origin)。
-2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);09-06 新增 **dispatch=exec(方案 Y)**(固定 bind 保前缀缓存,`e797cc0`);单测 **61/61 通过**(§2),提交状态见 §3.3/§4.6。
+2. **现状**:Phase-1 路由(统一 `benchmark/tool_router.py`)+ 执行期鲁棒性 + Meta-Tool(元工具)模式已落地;09-04 会话按用户实测决策**移除 react_router 双轨**,并把 `_tool_search` 的稀疏 TF-IDF 检索升级为 **Hybrid 融合检索**(稠密 bge 向量 + 稀疏 TF-IDF,参考 Spring AI Alibaba 工具检索思路);09-06 新增 **dispatch=exec(方案 Y)**(固定 bind 保前缀缓存,`e797cc0`);09-08 新增 **Phase 3 分层记忆 V1**(Episodic 事实层 + 摘要替换压缩,默认关零污染);单测 **80/80 通过**(§2),提交状态见 §3.3/§4.6/§4.7。
 3. **hybrid e2e 已跑出(100 runs / 31.0%),oracle 口径对检索无区分度(09-05 关键发现)**:用户首轮小样本端到端 meta_tool 32.35% vs react-oracle 30.39%(非显著);hybrid 真池离线数字已出(§4.6.3:meta_sim final_recall 31.9% vs tfidf 27.5%、zero% 6%→0);端到端 `--retrieval hybrid` 100 runs 成功 31(31.0%,hr/oracle)。**口径红线**:oracle 模式 executor 把可用池过滤成 selected_tools(GT)白名单 → `_tool_search` 只在"答案池"里检索,检索后端对成功率**无区分度** → 31.0% vs 32.35% 的差异 = 单次运行噪声。hybrid 有效性的真正证据 = **带干扰工具的全量池 AB 对照(§4.6.6)**:09-07 email 域 67 tasks 配对已闭环 —— **exec/hybrid 53.73% ≈ inject/hybrid(同池,差异很小)≈ react-oracle 基线 59.70% 的 90%**,工具检索/分发主线收尾;dispatch=exec(方案 Y,固定 bind 保前缀缓存)已入库 `e797cc0`。
-4. **Phase 2 verifier-in-the-loop V1 已落地并跑出方向证据(§4.6.7)**:收尾门禁(claim-done 不再直接 break,强制业务只读工具回读核对 checklist,红线内零 verifier 触达)email 域配对 **clean 64.06% vs baseline 55.38%**(+8.7pp,saved 8/regressed 3,**McNemar p=0.227 未显著**);代价:执行耗时 ~2.33x / LLM 轮次 ~1.5x;单测 66/66;分析脚本 analyze_vloop_runs.py。**下一步 = 第二卷定显著性 + Phase 3 分层记忆(设计先行)**。
+4. **Phase 2 verifier-in-the-loop V1 已落地并跑出方向证据(§4.6.7)**:收尾门禁(claim-done 不再直接 break,强制业务只读工具回读核对 checklist,红线内零 verifier 触达)email 域配对 **clean 64.06% vs baseline 55.38%**(+8.7pp,saved 8/regressed 3,**McNemar p=0.227 未显著**);代价:执行耗时 ~2.33x / LLM 轮次 ~1.5x;09-08 收口第二卷佐证(out/email_vloop/run_2,48 任务部分重跑,**非独立任务卷**,§4.6.7 补记):单卷 p=0.2891、与卷一并集去重 p=0.0923、观测级相加 p=0.0636 —— **均未达显著**,结论维持"方向证据、收益在噪声内";分析脚本 analyze_vloop_runs.py。
+5. **Phase 3 分层记忆 V1 已设计定稿并落地(§4.7,默认关)**:Episodic 事实层(确定性 code 抽取,零 LLM 零虚构)+ 摘要替换压缩(整轮折叠 → `[system] memory recap`,保最近 N 轮);七项设计问题用户逐项确认,设计权威 `docs/memory_design.md`(commit 81745fa);红线与 selected_tools 同级(记忆/压缩零 verifier 触达)。**下一步 = 服务端端到端对照(meta_tool+exec+hybrid+verify_loop vs +memory,email 67 全量池,命令见 §4.7)**。
 
 ---
 
@@ -31,7 +32,7 @@
 | 事项 | 事实 |
 |---|---|
 | **真实 Python 环境** | 项目 `.venv`(Python 3.14.3,含 langchain_core 等全部依赖)。⚠️ 受管 python 3.13 与系统 anaconda **均无 langchain_core**;凡 import orchestrators / benchmark.llm_client 的代码只能用 `.\.venv\Scripts\python.exe` |
-| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **61 passed**(test_tool_router 33 + test_meta_tool_router 17 + test_dense_retriever 11;test_react_router 7 已随 react_router 移除);路由模块本身纯 stdlib,任意 py3 可跑,但 dense 相关测试需 numpy |
+| **单测命令** | `./.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py"` → **80 passed**(test_tool_router 33 + test_meta_tool_router 22 + test_dense_retriever 11 + test_episodic_memory 14;test_react_router 7 已随 react_router 移除);路由模块本身纯 stdlib,任意 py3 可跑,但 dense 相关测试需 numpy |
 | **numpy / 3.14 坑** | `.venv` = Python 3.14.3 → 必须 numpy ≥ 2.3(cp314 wheel;numpy 2.0.2 无 cp314 会卡源码编译)。装法:`uv pip install --python .venv/Scripts/python.exe "numpy>=2.3" -i https://pypi.tuna.tsinghua.edu.cn/simple`(官方 PyPI 慢/易中断;中断会留下缺 `__init__.py` 的假 numpy —— 先 `rm -rf .venv/Lib/site-packages/numpy` 再重装);sentence-transformers/torch 同理建议 `-i` 清华镜像 + 设 `HF_ENDPOINT=https://hf-mirror.com`(首次拉 bge 模型) |
 | **LLM key / 容器** | 本地 `conf/llm/` 不存在 → 端到端被 key 阻塞;容器/udocker 全套指令见 `RUN_GUIDE.md`(服务端已验证;本地 docker daemon 曾静默失败) |
 | **真实工具池** | `tools_dump.json`(仓库根,512 原始条目含 `_domain`,按 (name,_domain) 去重后 458)**已入库**(2c2b62f);⚠️ MCP `tools/list` 真实 schema 字段是 `inputSchema`(驼峰),dump/测试用 `input_schema`(小写)——`build_tool_signature` 已双兼容 |
@@ -280,6 +281,36 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
   3. 3 个 error 全为 timeout(verify_loop 拉长单任务 → 同 concurrency 超时概率上升),建议降 concurrency 或调大 LLM 超时;
   4. 域限定:仅 email;clean 口径 64.06% 与含 error 的 compute_score 口径 61.19% 不同,引用须注明口径。
 
+- **第二卷佐证收口(09-08 补)**:`out/email_vloop/run_2`(email_vloop_2)= **48 任务部分卷**(服务端中断/部分下载),0 error,clean 34/48 = **70.83%**,Verifier Pass 均值 85.76%;与 run_1 **共享同一 baseline 卷**(§4.6.6 exec/hybrid 67),48 任务 ⊂ run_1 的 67(**同批任务的部分重跑,非独立任务样本**)。本地复核(复用 analyze_vloop_runs.py 口径,重建自三卷文件):
+
+  | 合并口径 | saved | regressed | N | McNemar p |
+  |---|---|---|---|---|
+  | run_2 单卷(48 干净对) | 6 | 2 | 8 | 0.2891(未显著) |
+  | run_1 单卷(63 干净对,§4.6.7) | 8 | 3 | 11 | 0.2266(未显著) |
+  | 两卷任务级并集去重(run_2 只新增 2 saved) | 10 | 3 | 13 | 0.0923(未显著) |
+  | 两卷观测级直接相加(同任务两次采样均计) | 14 | 5 | 19 | 0.0636(未显著) |
+
+  两卷**无方向冲突翻转**(run_1 saved ∩ run_2 regressed = 0,反向亦 0;4/6 saved 与 2/2 regressed 落在相同任务)→ 方向一致、无相反证据。但 run_2 ⊂ run_1 意味着它**不构成独立复制实验**(真正定显著性仍需 teams 域或新 seed 的独立任务卷),且部分卷本身有选择偏差风险。**结论维持 §4.6.7 口径:方向证据、收益在噪声内;报告若引用 run_2,须注明"48 子集、同批重跑、非独立卷、p 均未达 0.05"。**
+
+### 4.7 09-08 补记:Phase 3 分层记忆 V1 落地(设计定稿 → 实现 → 单测;默认关,待服务端对照)
+
+- **流程**:先与用户逐项对齐七项设计问题(AskUserQuestion 逐项确认,全选推荐项)→ 落盘设计定稿 `docs/memory_design.md`(commit `81745fa`,Phase 3 V1 唯一权威,含决策表/实现规格/评估口径/红线)→ 再实现。七项定稿:① V1 只做 **Episodic 一层**(Working 由上下文+gate checklist 承担,Semantic 后置);② 事实来源 = **code 确定性抽取**(零 LLM 零虚构,只记成功业务工具结果);③ 压缩 = **摘要替换 + 保留最近 N 轮原始消息**;④ verify_loop 接口:checklist = Working 目标态,不入 episodic,事实层独立;⑤ V1 **不做 DAG/replan**(§3.4 后置);⑥ 评估 = verify_loop on + memory 对照(同池同模型单变量);⑦ 红线 = 记忆/压缩零 verifier 触达(与 selected_tools 同级)。
+- **实现(commit `020b583`)**:新增 `orchestrators/episodic_memory.py`(纯函数层,可单测):`Fact` dataclass(entity/attribute/value/source_tool/ts)、`unwrap_mcp_result`(**isError=True 守卫** —— 真失败不抽,外层 success 恒 True 的 MCP 陷阱)、`extract_facts`(create-like 优先结果新 id、`_ID_KEY_CANDIDATES` id/*_id/email/sys_id、`_ATTR_KEYS` status/state/enabled/verified 等、`_token_pos` 全 token 扫描支持 email_ 域前缀动词、max_per_call=3)、`render_recap`(ts 倒序,≤1500 字符)。`orchestrators/meta_tool_router.py`:常量 `DEFAULT_MEMORY=False`(默认关,旧口径零污染)/`MEMORY_FOLD_AFTER_ROUNDS=12`/`MEMORY_KEEP_ROUNDS=6`/`MEMORY_MAX_FACTS=40`;`__init__` 增 `memory/memory_fold_after/memory_keep_rounds`;两条真实工具成功路径调 `_mem_note_success`;`_maybe_fold` 把最老的已完整业务轮**原位替换**为一条 `[system] memory recap`(stage=memory_recap),`_mem_head` 锚点 + starts 平移保 tool_call↔tool_result 配对;**gate/checklist/remind 消息永不折叠、gate 激活期停折**;`conversation_flow` 不删条目仅插审计标记,`tool_results` 独立执行审计不受压缩影响;`_mem_rounds = iteration+1` 保单调。`evaluate.py`:`--memory/--memory_fold_after/--memory_keep_rounds` 透传。metadata 落 `mem_*` 字段(关时零污染)。
+- **测试与验证**:新增 `tests/test_episodic_memory.py` 14 例(抽取纯函数 7 + render 2 + 折叠集成 5,含"isError payload 永不抽取""gate 激活停折""verifier 零触达""memory 关零污染"红线用例),**全量回归 80/80 通过**(66→80)。真实 email 域数据回放:270 次成功调用抽 **50 事实(19%)**,写工具(create/delete/modify/verify)全命中、读工具保守跳过(宁缺毋滥,抽取率低是设计选择非缺陷);自定义 orchestrator 集成验证:**folds=3 后孤儿 ToolMessage=0**(配对完整)、tool_results 8(执行审计独立)、conversation_flow 22 全量保留 + memory_recap 审计标记、meta.mem_rounds 单调。
+- **服务端对照实验命令(待跑,email 67 全量池,与 §4.6.6/§4.6.7 同 split/同模型/同 concurrency)**:
+
+```bash
+# 对照 = 当前完整链(同 §4.6.7 verify_loop 卷口径)
+evaluate.py --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
+  --verify_loop --samples email  (输出至 out/email_memory/run_base,或复用 §4.6.7 baseline 卷)
+# 实验 = 同链 + memory(单变量)
+evaluate.py --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
+  --verify_loop --memory --memory_fold_after 12 --memory_keep_rounds 6 --samples email \
+  (输出至 out/email_memory/run_mem)
+```
+
+  分析:任务级配对 + 按真实业务工具调用数分桶(长任务分层增益是 Phase 3 卖点);成本账 = 记忆**不新增 LLM 调用**(关键卖点,区别于 Phase 2 的 +1 规划轮)→ 若同成功率下 token/耗时下降即"白拿"。
+
 ---
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
@@ -291,7 +322,7 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 5. **【已知行为】** `_tool_search` 零词法+低语义(如幻觉名)→ 零命中 → 回喂引导不中断;连续 3 次零命中兜底 bind 全池防死锁(hybrid 下 zero% 已归零,兜底预计很少触发)。
 6. **【潜在 bug,已单测覆盖】** LLM 一次发多个 tool_call 的并行处理、注入说明插入位置 —— 单测已覆盖;`tool_call_id` 真实端到端匹配与 hybrid 下 bge 编码耗时仍需服务端验证。
 7. **【环境坑】** 服务器 sentence-transformers + torch 安装体积大;bge 首次下载设 `HF_ENDPOINT=https://hf-mirror.com`;Python 3.14 需 numpy≥2.3(cp314)。**依赖只信 pyproject**:uv sync 只装声明的依赖,老环境手工装过的包(nest_asyncio/aiohttp 等)在新装环境会缺 → 已补声明(`086bcea`);再遇 ModuleNotFoundError 照提示补装并把包名回报。
-8. **【待定论】verify_loop 有效性:方向证据、未显著、成本高**(§4.6.7):email 配对 saved 8/regressed 3、McNemar p=0.227(单 run);clean 成功率 +8.7pp 但执行耗时 ~2.33x、LLM 轮次 ~1.5x。需第二卷(同池再 1 seed 或 teams 域)合并定显著性;若显著则"半途而废救场"叙事成立,再评估降本(是否只对高风险任务启 gate / gate 提示精简)。FINAL 前缀模型不遵守(0%),不强校验仅统计。
+8. **【待定论】verify_loop 有效性:方向证据、未显著、成本高**(§4.6.7 + 09-08 佐证):email 配对 run_1 saved 8/regressed 3、McNemar p=0.227;第二卷佐证已收口(run_2 = 48 子集 **⊂ run_1 67,同批部分重跑,非独立任务卷**,§4.6.7 补记):单卷 p=0.2891、任务级并集去重 p=0.0923、观测级相加 p=0.0636 —— **均未达 0.05、无方向冲突翻转**。clean +8.7pp、成本 ~2.33x 耗时。**真正定显著性仍需独立任务卷(teams 域或新 seed 全量 67)**,非 run_2 这种同批重跑;若显著则"半途而废救场"叙事成立,再评估降本(是否只对高风险任务启 gate / gate 提示精简)。FINAL 前缀模型不遵守(0%),不强校验仅统计。
 
 ---
 
@@ -308,22 +339,23 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 | 7 | 【P2】bge 选型与 query 指令实验:bge-small vs bge-base vs e5;`query_instruction` 是否开启(当前空串)对域内检索的影响 | #4 环境 | 检索质量上限 |
 | 8 | 【P2】稠密通道噪声诊断:dense 对同族动作(add/update/delete×…)是否更钝?需要时在 hybrid 里给精确名/参数键加权(稀疏通道天然负责) | #4 数据 | 误报控制 |
 | 9 | LOOKUP_FLOOR 0.15 默认化(仅在仍保留 top_k 兜底路径时需要) | #4 数据 | 即得 recall 增益 |
-| 10 | **【🔄 Phase 2 验证闭环,V1 已落地待定论】verifier-in-the-loop 收尾门禁**:设计/实现见 NEXT_SESSION_PROMPT(09-07)与 §4.6.7。判据红线(人类专家离线编写、不随任务告知 agent;orchestrator 可触达 self.config.verifiers 但**禁止**注入/自查/纠错)全程遵守,自查只走业务只读工具 + 首轮 checklist。email 配对 clean +8.7pp(saved 8/regressed 3,**McNemar p=0.227 未显著**),成本 ~2.33x 耗时。**下一步:第二卷(同池再 1 seed 或 teams 域)合并定显著性 → 达标后回填为"已验证"** | ✅ V1(a68dde3 + 3c2e67e) | Phase 3 记忆前置;取代 LLM 自评合规 |
+| 10 | **【🔄 方向证据维持,待独立任务卷定论】Phase 2 verifier-in-the-loop 收尾门禁**:设计/实现见 NEXT_SESSION_PROMPT(09-07)与 §4.6.7。判据红线(人类专家离线编写、不随任务告知 agent;orchestrator 可触达 self.config.verifiers 但**禁止**注入/自查/纠错)全程遵守,自查只走业务只读工具 + 首轮 checklist。email 配对 clean +8.7pp(saved 8/regressed 3,**p=0.227 未显著**),成本 ~2.33x 耗时;09-08 run_2 佐证收口(三档 p 0.2891/0.0923/0.0636 均未达显著,非独立卷)。**下一步:teams 域或新 seed 独立卷合并定显著性 → 达标后回填为"已验证"** | ✅ V1(a68dde3 + 3c2e67e)+ run_2 佐证(09-08) | 取代 LLM 自评合规;Phase 3 记忆的超参对照基准 |
+| 11 | **【P0,服务端待跑】Phase 3 分层记忆 V1 端到端对照**:对照 = 当前完整链(meta_tool + exec + hybrid + verify_loop,email 67 全量池,复用 §4.6.7 baseline 卷);实验 = 同链 + `--memory --memory_fold_after 12 --memory_keep_rounds 6`(单变量);`compute_score.py` 聚合 + 按**真实业务工具调用数分桶**看长任务分层增益(Phase 3 卖点,不只平均);成本账 = 记忆**零新增 LLM 调用**(区别于 Phase 2 的 +1 规划轮),同成功率下 token/耗时下降即"白拿" | ✅ 设计 81745fa + 实现(09-08,§4.7) | **Phase 3 主线首验**;长任务分层增益 + 成本不劣 → 记忆叙事成立 |
 
-✅ 已完成(2026-08-31~09-07):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(§4.6.6)**;**Phase 2 verifier-in-the-loop V1(a68dde3)+ 收口分析脚本(3c2e67e)+ email 配对方向证据(§4.6.7,未显著,p=0.227)**。
+✅ 已完成(2026-08-31~09-08):执行期鲁棒性(9a04a3d)+ 意图级检索(2c2b62f);MetaToolOrchestrator + evaluate 注册 + eval_router 离线指标(7edee85);**dense/hybrid 检索后端 + react_router 移除 + `.[dense]` extra(6c308bb)**;三个运维 hotfix(25068d1/f8820d5/086bcea/21ee47b/2449049);服务端 hybrid 端到端 100 runs / 31.0% + oracle 口径发现(435c530 回填 §4.6.5);**dispatch=exec 方案 Y(e797cc0)+ email 域全量池配对结论(§4.6.6)**;**Phase 2 verifier-in-the-loop V1(a68dde3)+ 收口分析脚本(3c2e67e)+ email 配对方向证据(§4.6.7,未显著,p=0.227)+ run_2 佐证收口(09-08,非独立卷,合并仍未显著)**;**Phase 3 分层记忆 V1 设计定稿(memory_design.md,81745fa)+ 实现 + 单测 80/80(09-08,§4.7)**。
 
-长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正(→ 第二卷定显著性)→ 分层记忆+动态计划 → 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
+长期主线(Phase 2 起,见 agent_design_plan.md 3-6 节):verifier-in-the-loop 自纠正(→ 独立任务卷定显著性)→ **分层记忆 V1(已实现,待服务端对照)→ 动态计划(后置)**→ 政策合规引擎。每完成一阶段按惯例更新本文档与 memory 日志。
 
 ---
 
 ## 7. 参考资料与入口速查
 
-- 设计:`docs/agent_design_plan.md`(总方案)、`docs/tool_router_design.md`(路由详细设计)
-- 代码:`benchmark/tool_router.py`(路由唯一实现,tfidf/dense/hybrid 可插拔)、`benchmark/dense_retriever.py`(稠密后端:TextEmbedder/DenseIndex/get_embedder)、`orchestrators/meta_tool_router.py`(Meta-Tool 主通道)、`benchmark/llm_client.py`(bind_tools ~L415)、`orchestrators/base.py`(_execute_tool_call)
+- 设计:`docs/agent_design_plan.md`(总方案)、`docs/tool_router_design.md`(路由详细设计)、`docs/memory_design.md`(Phase 3 记忆 V1 权威设计,09-08)
+- 代码:`benchmark/tool_router.py`(路由唯一实现,tfidf/dense/hybrid 可插拔)、`benchmark/dense_retriever.py`(稠密后端:TextEmbedder/DenseIndex/get_embedder)、`orchestrators/meta_tool_router.py`(Meta-Tool 主通道 + verify_loop + episodic 记忆)、`orchestrators/episodic_memory.py`(Phase 3 记忆纯函数层:抽取/解包/渲染)、`benchmark/llm_client.py`(bind_tools ~L415)、`orchestrators/base.py`(_execute_tool_call)
 - 评估:`eval_router.py`(离线,`--tools tools_dump.json` 真实池;`--retrieval auto|tfidf|dense|hybrid`;`--meta_sim`)、`evaluate.py`(端到端;ORCHESTRATOR_MAP = react/planner_react/decomposing/meta_tool;`--retrieval` 默认 hybrid)、`compute_score.py`、`RUN_GUIDE.md`(服务端容器/评测全流程)、`scripts/analyze_router_misses.py`(漏检归因)
 - 数据:`tools_dump.json`(512→458,_domain 分域)、`gym_dbs.zip`
 - 作品集:GitHub `enterprise-agent-control-plane`(README:实现状态如实标注)
-- 记忆:`.workbuddy/memory/2026-09-07.md`(本会话:email 全量池配对 + 工具主线收尾 + **Phase 2 V1 落地/配对结果**)、2026-09-06(dispatch=exec 落地 e797cc0 + X/Y 分析)、2026-09-05(全量池方案/oracle 口径)、09-04(dense/hybrid 落地)、09-03(ToolLLM 调研+意图检索落地)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
+- 记忆:`.workbuddy/memory/2026-09-08.md`(本会话:Phase 2 run_2 佐证收口 + **Phase 3 记忆 V1 设计定稿/实现/单测**)、2026-09-07.md(email 全量池配对 + 工具主线收尾 + **Phase 2 V1 落地/配对结果**)、2026-09-06(dispatch=exec 落地 e797cc0 + X/Y 分析)、2026-09-05(全量池方案/oracle 口径)、09-04(dense/hybrid 落地)、09-03(ToolLLM 调研+意图检索落地)、09-02(真实池评估与归因)、09-01(分支合并与环境坑)、08-31(作品集推送)
 
 ---
-*本文档由 2026-09-07 会话补记(email 域全量池配对 + Phase 2 verifier-in-the-loop V1 落地与配对结果 §4.6.7;HEAD = a68dde3,功能链 a68dde3←e797cc0;分析脚本 3c2e67e),供新会话无缝接手。实现状态均已如实标注(verify_loop 方向证据、McNemar p=0.227 未显著、成本 ~2.33x);下一步 = 第二卷定显著性 + Phase 3 分层记忆设计先行。*
+*本文档由 2026-09-08 会话补记(Phase 2 第二卷佐证收口 §4.6.7 补记 + **Phase 3 分层记忆 V1 设计定稿与落地 §4.7**;功能 commit `020b583`(memory 实现),docs 回填为本 commit,设计 81745fa、verify_loop a68dde3),供新会话无缝接手。实现状态均已如实标注(verify_loop 方向证据、run_2 非独立卷三档 p 0.2891/0.0923/0.0636 均未达 0.05、成本 ~2.33x;Phase 3 记忆默认关、单测 80/80、待服务端对照);下一步 = Phase 3 记忆端到端对照(email 67 全量池,命令见 §4.7)+ 呈现。*
