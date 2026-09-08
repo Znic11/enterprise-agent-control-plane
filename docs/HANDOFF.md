@@ -297,19 +297,47 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 - **流程**:先与用户逐项对齐七项设计问题(AskUserQuestion 逐项确认,全选推荐项)→ 落盘设计定稿 `docs/memory_design.md`(commit `81745fa`,Phase 3 V1 唯一权威,含决策表/实现规格/评估口径/红线)→ 再实现。七项定稿:① V1 只做 **Episodic 一层**(Working 由上下文+gate checklist 承担,Semantic 后置);② 事实来源 = **code 确定性抽取**(零 LLM 零虚构,只记成功业务工具结果);③ 压缩 = **摘要替换 + 保留最近 N 轮原始消息**;④ verify_loop 接口:checklist = Working 目标态,不入 episodic,事实层独立;⑤ V1 **不做 DAG/replan**(§3.4 后置);⑥ 评估 = verify_loop on + memory 对照(同池同模型单变量);⑦ 红线 = 记忆/压缩零 verifier 触达(与 selected_tools 同级)。
 - **实现(commit `020b583`)**:新增 `orchestrators/episodic_memory.py`(纯函数层,可单测):`Fact` dataclass(entity/attribute/value/source_tool/ts)、`unwrap_mcp_result`(**isError=True 守卫** —— 真失败不抽,外层 success 恒 True 的 MCP 陷阱)、`extract_facts`(create-like 优先结果新 id、`_ID_KEY_CANDIDATES` id/*_id/email/sys_id、`_ATTR_KEYS` status/state/enabled/verified 等、`_token_pos` 全 token 扫描支持 email_ 域前缀动词、max_per_call=3)、`render_recap`(ts 倒序,≤1500 字符)。`orchestrators/meta_tool_router.py`:常量 `DEFAULT_MEMORY=False`(默认关,旧口径零污染)/`MEMORY_FOLD_AFTER_ROUNDS=12`/`MEMORY_KEEP_ROUNDS=6`/`MEMORY_MAX_FACTS=40`;`__init__` 增 `memory/memory_fold_after/memory_keep_rounds`;两条真实工具成功路径调 `_mem_note_success`;`_maybe_fold` 把最老的已完整业务轮**原位替换**为一条 `[system] memory recap`(stage=memory_recap),`_mem_head` 锚点 + starts 平移保 tool_call↔tool_result 配对;**gate/checklist/remind 消息永不折叠、gate 激活期停折**;`conversation_flow` 不删条目仅插审计标记,`tool_results` 独立执行审计不受压缩影响;`_mem_rounds = iteration+1` 保单调。`evaluate.py`:`--memory/--memory_fold_after/--memory_keep_rounds` 透传。metadata 落 `mem_*` 字段(关时零污染)。
 - **测试与验证**:新增 `tests/test_episodic_memory.py` 14 例(抽取纯函数 7 + render 2 + 折叠集成 5,含"isError payload 永不抽取""gate 激活停折""verifier 零触达""memory 关零污染"红线用例),**全量回归 80/80 通过**(66→80)。真实 email 域数据回放:270 次成功调用抽 **50 事实(19%)**,写工具(create/delete/modify/verify)全命中、读工具保守跳过(宁缺毋滥,抽取率低是设计选择非缺陷);自定义 orchestrator 集成验证:**folds=3 后孤儿 ToolMessage=0**(配对完整)、tool_results 8(执行审计独立)、conversation_flow 22 全量保留 + memory_recap 审计标记、meta.mem_rounds 单调。
-- **服务端对照实验命令(待跑,email 67 全量池,与 §4.6.6/§4.6.7 同 split/同模型/同 concurrency)**:
+- **服务端对照实验命令(待跑,email 67 全量池 = HF `email/oracle` split 全部 configs;与 §4.6.7 对照卷同模型 deepseek-v4-flash)**。evaluate.py 无 `--samples` 参数,任务源用 `--hf_dataset + --domain email --mode oracle`,`--num_runs 1` 即 67 configs 单卷(先 `get_dataset_config_names('ServiceNow-AI/EnterpriseOps-Gym')` 确认 split 名):
 
 ```bash
-# 对照 = 当前完整链(同 §4.6.7 verify_loop 卷口径)
-evaluate.py --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
-  --verify_loop --samples email  (输出至 out/email_memory/run_base,或复用 §4.6.7 baseline 卷)
-# 实验 = 同链 + memory(单变量)
-evaluate.py --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
-  --verify_loop --memory --memory_fold_after 12 --memory_keep_rounds 6 --samples email \
-  (输出至 out/email_memory/run_mem)
+# —— 前置(一次性,未做过才做)——
+# unzip gym_dbs.zip                          # seed SQL 库不入 git,缺它 /api/seed-database 必失败
+# cp -r conf.example/ conf/                  # conf/llm + conf/ray
+# nohup udocker run gym_email > logs/email.log 2>&1 &   # email 域监听 8005;切域前 fuser -k 8005/tcp
+# 依赖:uv sync --extra dense;首次拉 bge 设 HF_ENDPOINT=https://hf-mirror.com
+
+# —— ① 对照卷 = 现状完整链(verify_loop on、memory off)。
+#     路线 A(省钱):直接复用 §4.6.7 已跑的 out/email_vloop/run_1 —— 它正是"同链无 memory",
+#     同池同模型,配对时作 baseline 即可,不必重跑(注意需与它当时同 concurrency 口径)。
+#     路线 B(严谨,消除模型版本漂移):与本卷同批重跑对照 ——
+./.venv/Scripts/python.exe evaluate.py \
+  --hf_dataset ServiceNow-AI/EnterpriseOps-Gym \
+  --domain email --mode oracle \
+  --llm_config conf/llm/deepseek-v4-flash.json \
+  --output_folder out/email_memory/run_base \
+  --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
+  --verify_loop --concurrency 4 --num_runs 1
+
+# —— ② 实验卷 = 同链 + memory(唯一变量)——
+./.venv/Scripts/python.exe evaluate.py \
+  --hf_dataset ServiceNow-AI/EnterpriseOps-Gym \
+  --domain email --mode oracle \
+  --llm_config conf/llm/deepseek-v4-flash.json \
+  --output_folder out/email_memory/run_mem \
+  --orchestrator meta_tool --retrieval hybrid --tool_dispatch exec \
+  --verify_loop --memory --memory_fold_after 12 --memory_keep_rounds 6 \
+  --concurrency 4 --num_runs 1
+
+# —— ③ 聚合 + 配对分析(clean 口径;baseline=对照卷,vloop=实验卷,analyze 脚本语义与参数名无关)——
+./.venv/Scripts/python.exe compute_score.py --results_folder out/email_memory/run_base
+./.venv/Scripts/python.exe compute_score.py --results_folder out/email_memory/run_mem
+./.venv/Scripts/python.exe scripts/analyze_vloop_runs.py \
+  --baseline_dir out/email_vloop/run_1 \
+  --vloop_dir out/email_memory/run_mem \
+  --out out/memory_report
 ```
 
-  分析:任务级配对 + 按真实业务工具调用数分桶(长任务分层增益是 Phase 3 卖点);成本账 = 记忆**不新增 LLM 调用**(关键卖点,区别于 Phase 2 的 +1 规划轮)→ 若同成功率下 token/耗时下降即"白拿"。
+  分析要点:① 任务级配对(analyze 脚本直接给出 saved/regressed + McNemar p);② **记忆收益应在长任务子集** —— 实验卷中 `mem_folds>0`(实际触发折叠)的任务与对照卷同任务配对,是记忆真正起作用的样本,单独看;③ 按真实业务工具调用数/轮数分桶看分层增益;④ 成本账 = 记忆**不新增 LLM 调用**(关键卖点,区别于 Phase 2 的 +1 规划轮),对照两卷执行耗时/LLM 轮次/token,若同成功率下下降即"白拿";⑤ 对照卷若复用 email_vloop/run_1,report 须注明对照卷是历史批次;⑥ 若复现 timeout 且决定降 concurrency,两卷必须同值。
 
 ---
 
