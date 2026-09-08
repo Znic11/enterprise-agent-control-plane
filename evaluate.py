@@ -195,6 +195,7 @@ async def execute_sample(
     retrieval="hybrid", embedding_model=None, embedding_device=None,
     hybrid_alpha=0.5, tool_dispatch="inject",
     verify_loop=False, verify_max_rounds=3,
+    memory=False, memory_fold_after=None, memory_keep_rounds=None,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -231,6 +232,12 @@ async def execute_sample(
         # verifier-in-the-loop(验证闭环 V1):默认关,开则收尾强制只读回读核对
         orchestrator_kwargs["verify_loop"] = verify_loop
         orchestrator_kwargs["verify_max_rounds"] = verify_max_rounds
+        # episodic 记忆(Phase 3 V1):默认关;开则成功工具结果确定性抽事实 + 折叠
+        orchestrator_kwargs["memory"] = memory
+        if memory_fold_after is not None:
+            orchestrator_kwargs["memory_fold_after"] = memory_fold_after
+        if memory_keep_rounds is not None:
+            orchestrator_kwargs["memory_keep_rounds"] = memory_keep_rounds
 
     executor = BenchmarkExecutor(
         config,
@@ -376,6 +383,29 @@ async def main():
         help="Max no-evidence reminders before the completion gate force-done "
              "(meta_tool + --verify_loop only).",
     )
+    parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="Enable the episodic memory layer (meta_tool only, Phase 3 V1). "
+             "Facts are extracted deterministically from successful business "
+             "tool results (no LLM calls); old full rounds are folded into a "
+             "single '[system] memory recap' while the recent N rounds stay "
+             "verbatim. Never reads verifier criteria (SQL/expected values).",
+    )
+    parser.add_argument(
+        "--memory_fold_after",
+        type=int,
+        default=None,
+        help="Fold oldest rounds once completed rounds exceed this count "
+             "(meta_tool + --memory only; default 12).",
+    )
+    parser.add_argument(
+        "--memory_keep_rounds",
+        type=int,
+        default=None,
+        help="Keep this many most recent raw rounds after folding "
+             "(meta_tool + --memory only; default 6).",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
@@ -446,6 +476,9 @@ async def main():
                 tool_dispatch=args.tool_dispatch,
                 verify_loop=args.verify_loop,
                 verify_max_rounds=args.verify_max_rounds,
+                memory=args.memory,
+                memory_fold_after=args.memory_fold_after,
+                memory_keep_rounds=args.memory_keep_rounds,
             ),
             concurrency=int(args.concurrency),
         )

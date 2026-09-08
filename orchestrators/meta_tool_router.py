@@ -44,6 +44,7 @@ from benchmark.models import BenchmarkConfig
 from benchmark.tool_router import DEFAULT_HYBRID_ALPHA, ToolRouter
 
 from .base import AgentOrchestrator
+from .episodic_memory import Fact, extract_facts, render_recap
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,19 @@ DEFAULT_CACHE_SIZE = 64         # 同会话 query->hits 缓存上限
 DEFAULT_ZERO_HIT_FALLBACK = 3   # 连续零命中达此值 -> 兜底绑定全池,防死锁(None=关闭兜底)
 DEFAULT_RETRIEVAL = "tfidf"     # 检索后端默认 tfidf(纯 stdlib 保单测/离线一致);
                                 # evaluate.py 端到端 CLI 默认 hybrid(evaluate 边界显式指定)
+
+# ---------------------------------------------------------------------------
+# episodic 记忆层(Phase 3 V1):已确认事实 + 摘要替换压缩。
+# 红线:事实只来自成功业务工具结果(code 确定性抽取,零 LLM);绝不读
+# self.config.verifiers;压缩不破坏 tool_call↔tool_result 配对;verify_loop
+# 的 checklist/gate/remind 消息永不折叠;memory=False 时零污染。
+# 设计权威: docs/memory_design.md。
+# ---------------------------------------------------------------------------
+DEFAULT_MEMORY = False          # 默认关,保旧口径;实验卷 evaluate --memory 开
+MEMORY_FOLD_AFTER_ROUNDS = 12   # 轮次超过该值触发一次折叠(只影响长任务)
+MEMORY_KEEP_ROUNDS = 6          # 折叠后保留的最近原始轮次
+MEMORY_MAX_FACTS = 40           # 事实库上限(超出丢最旧,逻辑层与消息无关)
+MEMORY_RECAP_CHARS = 1500       # recap 注入文本长度上限
 
 # ---------------------------------------------------------------------------
 # verifier-in-the-loop(验证闭环,V1):仅在"宣布完成前"强制一轮终态核对。
@@ -227,6 +241,9 @@ class MetaToolOrchestrator(AgentOrchestrator):
         dispatch: str = "inject",
         verify_loop: bool = False,
         verify_max_rounds: int = DEFAULT_VERIFY_MAX_ROUNDS,
+        memory: bool = DEFAULT_MEMORY,
+        memory_fold_after: Optional[int] = None,
+        memory_keep_rounds: Optional[int] = None,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -244,6 +261,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
             raise ValueError(f"warmup_top_k must be >= 1 or None, got {warmup_top_k}")
         if verify_max_rounds < 1:
             raise ValueError(f"verify_max_rounds must be >= 1, got {verify_max_rounds}")
+        if memory_fold_after is not None and memory_fold_after < 1:
+            raise ValueError(f"memory_fold_after must be >= 1 or None, got {memory_fold_after}")
+        if memory_keep_rounds is not None and memory_keep_rounds < 1:
+            raise ValueError(f"memory_keep_rounds must be >= 1 or None, got {memory_keep_rounds}")
 
         self.tool_search_top_k = tool_search_top_k
         self.tool_search_min_score = tool_search_min_score
@@ -256,6 +277,13 @@ class MetaToolOrchestrator(AgentOrchestrator):
         self.dispatch = dispatch
         self.verify_loop = verify_loop
         self.verify_max_rounds = verify_max_rounds
+        self.memory = memory
+        self._mem_fold_after = (
+            memory_fold_after if memory_fold_after is not None else MEMORY_FOLD_AFTER_ROUNDS
+        )
+        self._mem_keep_rounds = (
+            memory_keep_rounds if memory_keep_rounds is not None else MEMORY_KEEP_ROUNDS
+        )
 
         # verifier-in-loop 运行期状态(每次 execute() 开始重置)
         self._vl_checklist: str = ""
@@ -269,6 +297,17 @@ class MetaToolOrchestrator(AgentOrchestrator):
         self._vl_accepted = False
         self._vl_final_marker = False
         self._vl_plan_calls = 0
+
+        # episodic 记忆运行期状态(每次 execute() 开始重置)
+        self._mem_facts: List[Fact] = []
+        self._mem_folds = 0
+        self._mem_recap_chars = 0
+        self._mem_kept_rounds = 0
+        self._mem_rounds = 0
+        # 折叠锚点:mem_head = 前缀长度(system/user/[checklist])之后才可折叠;
+        # 折叠轮起点列表(每轮 invoke 前记录,折叠后平移修正)
+        self._mem_head = 2
+        self._mem_round_starts: List[int] = []
 
         # 检索后端:默认 tfidf(纯 stdlib);dense/hybrid 时优先用注入的 embedder
         # (单测/调用方提供),否则经 get_embedder 拿模块级单例(每进程加载一次)。
@@ -625,6 +664,102 @@ class MetaToolOrchestrator(AgentOrchestrator):
         return False, VL_REMIND_MESSAGE, "verify_loop_remind"
 
     # ------------------------------------------------------------------
+    # episodic 记忆层(Phase 3 V1):事实记录 + 摘要替换折叠
+    # ------------------------------------------------------------------
+
+    def _reset_mem_state(self) -> None:
+        """每次 execute() 开始重置记忆运行期状态(或chestrator 每任务新实例,双保险)。"""
+        self._mem_facts = []
+        self._mem_folds = 0
+        self._mem_recap_chars = 0
+        self._mem_kept_rounds = 0
+        self._mem_rounds = 0
+        self._mem_head = 2   # 前缀 system+user(+checklist 注入后 +1),execute 中校准
+        self._mem_round_starts: List[int] = []
+
+    def _mem_note_success(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        mcp_payload: Any,
+    ) -> None:
+        """成功业务工具调用后:确定性抽取事实入库(零 LLM;只读工具结果,
+        绝不触碰 self.config.verifiers —— 与 selected_tools 同级红线)。"""
+        if not self.memory:
+            return
+        facts = extract_facts(
+            tool_name, tool_args, mcp_payload, ts=self._mem_rounds
+        )
+        for f in facts:
+            self._mem_facts.append(f)
+        if len(self._mem_facts) > MEMORY_MAX_FACTS:
+            self._mem_facts = self._mem_facts[-MEMORY_MAX_FACTS:]
+
+    def _mem_recap_text(self) -> str:
+        """由事实库渲染 recap(最新在前,超长截断)。"""
+        return render_recap(self._mem_facts, max_chars=MEMORY_RECAP_CHARS)
+
+    def _maybe_fold(
+        self,
+        messages: List[Any],
+        conversation_flow: List[Dict[str, Any]],
+    ) -> None:
+        """把最老的已完整业务轮折叠为一条 [system] memory recap(原位替换)。
+
+        规则(红线内,见 docs/memory_design.md §2.2):
+          * 触发:完成轮数 > fold_after(默认 12)才折;折叠最老的
+            (完成轮数 - keep) 轮,保留最近 keep 轮原始消息;
+          * 折叠区间 = [mem_head, 保留区起点),mem_head 之前(system/user/
+            verify checklist 注入)永不删除 —— 旧 recap 位于 mem_head 处,
+            会随下次折叠被新 recap 原位替换,不会多条累积;
+          * 折叠最小单元 = 完整轮次(assistant + ToolMessages + 注入说明),
+            保证 tool_call↔tool_result 配对不被破坏;
+          * verify_loop gate 激活后不再折叠(gate/remind 收尾消息全保留);
+          * conversation_flow 不删条目,仅在折叠点插 memory_recap 审计标记
+            (原始轨迹完整可审计,压缩只作用于 LLM 上下文 messages)。
+        """
+        if not self.memory or self._vl_gate_active:
+            return
+        starts = self._mem_round_starts
+        done_rounds = len(starts)            # 调用时机:本轮起点 append 前 -> 全为已完成轮
+        if done_rounds <= self._mem_fold_after:
+            return
+        keep = self._mem_keep_rounds
+        if done_rounds <= keep:
+            return
+        head = self._mem_head
+        end = starts[-keep] if len(starts) >= keep else len(messages)
+        if end <= head or end > len(messages):
+            return
+        recap = self._mem_recap_text()
+        if not recap:
+            return
+        # 原位替换:删 [head, end) -> 在 head 处插 recap
+        del messages[head:end]
+        recap_msg = HumanMessage(
+            content=f"[system] memory recap (earlier tool results, verified):\n{recap}"
+        )
+        messages.insert(head, recap_msg)
+        # 修正剩余轮起点索引(删除 end-head 条,插入 1 条 -> 净平移 end-head-1)
+        delta = end - head - 1
+        self._mem_round_starts = [
+            s - delta for s in starts[-keep:] if s >= end
+        ]
+        # conversation_flow:不删原始条目,插审计标记(压缩只作用 messages)
+        conversation_flow.append({
+            "type": "system_message",
+            "stage": "memory_recap",
+            "content": recap[:500],
+        })
+        self._mem_folds += 1
+        self._mem_recap_chars = len(recap)
+        self._mem_kept_rounds = len(self._mem_round_starts)
+        logger.info(
+            f"[MEMORY] folded {done_rounds - keep} round(s) (head={head}, end={end}); "
+            f"kept {self._mem_kept_rounds} recent rounds; recap {len(recap)} chars"
+        )
+
+    # ------------------------------------------------------------------
     # 元数据(审计/离线指标)
     # ------------------------------------------------------------------
 
@@ -659,6 +794,13 @@ class MetaToolOrchestrator(AgentOrchestrator):
             meta["vl_forced_done"] = self._vl_forced_done
             meta["vl_plan_calls"] = self._vl_plan_calls
             meta["vl_final_marker"] = self._vl_final_marker
+        if self.memory:
+            meta["mem_enabled"] = True
+            meta["mem_facts"] = len(self._mem_facts)
+            meta["mem_folds"] = self._mem_folds
+            meta["mem_recap_chars"] = self._mem_recap_chars
+            meta["mem_kept_rounds"] = self._mem_kept_rounds
+            meta["mem_rounds"] = self._mem_rounds
         return meta
 
     # ------------------------------------------------------------------
@@ -668,6 +810,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
     async def execute(self) -> Dict[str, Any]:
         if self.verify_loop:
             self._reset_vl_state()
+        if self.memory:
+            self._reset_mem_state()
         messages = [
             SystemMessage(content=self.config.system_prompt),
             HumanMessage(content=self.config.user_prompt),
@@ -682,8 +826,18 @@ class MetaToolOrchestrator(AgentOrchestrator):
         # verifier-in-loop:首轮先让模型自列验收 checklist(不 bind、不执行任何工具)
         if self.verify_loop:
             await self._elicit_checklist(messages, conversation_flow)
+        # episodic 记忆:折叠锚点 = checklist(若有)注入后的前缀长度
+        if self.memory:
+            self._mem_head = len(messages)
 
         for iteration in range(self.max_iterations):
+            if self.memory:
+                # 折叠判定在 append 本轮起点前(此时 starts 全为已完成轮);
+                # 折叠会平移消息索引,随后 append 的是折叠后的当前位置。
+                self._maybe_fold(messages, conversation_flow)
+                self._mem_round_starts.append(len(messages))
+                # 事实轮次戳必须单调递增(不受折叠重置影响) -> 用 iteration
+                self._mem_rounds = iteration + 1
             visible = self._visible_tools()
             logger.info(
                 f"\n--- Iteration {iteration + 1} --- "
@@ -795,6 +949,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
                             if real_name not in tools_used:
                                 tools_used.append(real_name)
                             self._vl_note_real_tool(real_name, True)
+                            if tool_result.get("success", True):
+                                self._mem_note_success(
+                                    real_name, real_args, tool_result.get("result")
+                                )
                         except Exception as e:  # noqa: BLE001 — 单次失败不中断 run
                             logger.error(
                                 f"Tool '{real_name}' execution failed via "
@@ -823,6 +981,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         if tool_name not in tools_used:
                             tools_used.append(tool_name)
                         self._vl_note_real_tool(tool_name, True)
+                        if tool_result.get("success", True):
+                            self._mem_note_success(
+                                tool_name, tool_args, tool_result.get("result")
+                            )
                     except Exception as e:  # noqa: BLE001 — 单次失败不中断整个 run
                         logger.error(f"Tool '{tool_name}' execution failed: {e}")
                         tool_result = {
