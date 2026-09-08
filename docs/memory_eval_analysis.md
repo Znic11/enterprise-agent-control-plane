@@ -30,6 +30,16 @@
 4. 唯一 regressed 的折叠任务(af32832e,mem folds=1 失败 / ctl 成功,工具数 4 vs 7):单样本,不能归因;
    但其模式(对话更长 56 vs 27 条、业务工具反而少)可作 P1 个案复查素材。
 
+### 1.1 单例深挖:af32832e(regressed,mem 失败 / ctl 成功)—— 结论:非记忆所致
+
+对双卷完整对话轨迹逐条对比(2026-09-08,用户指定"先深挖单例"):
+
+- **任务**:检查/创建发给 bob@company.com、subject="Offer Confirmation" 的 draft;检查/创建黑色 "Bob" label;把 label 应用到 draft;不发送。
+- **CTL(成功,7 工具)**:`_tool_search` 命中并注入 `update_draft/get_draft/get_label/delete_draft/patch_label` 等(轨迹 [8][9])→ 用 `update_draft` 应用 label → gate 用 `get_draft/get_label` 回读 → verifier **3/3**。
+- **MEM(失败,4 工具)**:`_tool_search` **始终只注入 `list_drafts/create_draft/list_labels/create_label`**(轨迹 [7][8][19]),`update_draft/get_draft` 等**从未被检索命中**;模型 4 次明说"pool 里没有 modify/get draft 工具"([29][51][55])→ 无法应用 label、gate 无法回读 → 只能凭创建响应断言 → verifier **1/3**。
+- **因果判定**:MEM 卷的检索失败路径在**折叠发生之前**(第 12 轮前空转检索)就已注定;fold 在轨迹第 [41] 步注入一条 label 事实(无害但无帮助),此时败局已定。**失败根因 = LLM 生成的 `_tool_search` 查询差异 → 检索覆盖不同(run 噪声),与记忆折叠无因果关系**;与 Phase 2 已观察的 run 级噪声一致。
+- **顺带洞察**:记忆 V1 只记"已确认事实",不记"哪些工具可用/已试过/正确调法"(程序性记忆) → 对"检索路径已错"的任务帮不上忙;若未来要做,属 CoALA 程序记忆层(procedural),超出 V1 范围。
+
 **实验设计层面真正的教训**:fold 阈值 12 轮对 email 域偏高 → 折叠几乎不触发 → **对照实验没有
 检验到记忆层**(检验力 = 3 个样本)。要验证"记忆对长任务有益"或"记忆有害",必须先让实验里
 **记忆真的发生**:按任务轮次分布调阈值,或换更长任务域(teams/itsm),或按 token 触发。
