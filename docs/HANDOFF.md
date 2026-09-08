@@ -339,6 +339,8 @@ python eval_router.py --analyze_meta_runs out/meta_hybrid
 
   分析要点:① 任务级配对(analyze 脚本直接给出 saved/regressed + McNemar p);② **记忆收益应在长任务子集** —— 实验卷中 `mem_folds>0`(实际触发折叠)的任务与对照卷同任务配对,是记忆真正起作用的样本,单独看;③ 按真实业务工具调用数/轮数分桶看分层增益;④ 成本账 = 记忆**不新增 LLM 调用**(关键卖点,区别于 Phase 2 的 +1 规划轮),对照两卷执行耗时/LLM 轮次/token,若同成功率下下降即"白拿";⑤ 对照卷若复用 email_vloop/run_1,report 须注明对照卷是历史批次;⑥ 若复现 timeout 且决定降 concurrency,两卷必须同值。
 
+- **interim 实验数据与诊断(09-08 晚,run_mem 34/67 部分卷;完整诊断见 `docs/memory_eval_analysis.md`)**:⚠️ **"记忆导致成功率大幅下降"不成立** —— run_mem 34 文件 clean 18/31=58.1%(含 err 52.9%),**对照卷 email_vloop/run_1 同 34 任务 clean 19/33=57.6%**,差 +0.5pp;干净配对 saved 3/regressed 3、**McNemar p=1.0000(纯噪声)**;用户印象中"同进度 70–80%"是拿 run_2(48 任务选择偏差子集)当基线的错觉。真正的实验问题是**检验力不足**:34 任务中仅 **3 个触发折叠(folds>0)**,31 个记忆"空转"(无折叠=无注入=与无记忆逐字节一致,clean 16/28=57.1%)——email 域业务轮普遍 ≤12,fold 阈值 12 偏高。改进方向(memory_eval_analysis.md §4,待用户对齐):P0 调折叠触发(fold_after≈8 / 按 token 触发 / 换 teams 长任务域)+ 补"未折叠即零差异"回归测试;P1 事实生命周期(规则版失效而非删除,防过期事实 + 支撑删除型验收)、recap 显式保留实体 id/状态等后续必引用值并加 "may be stale" 护栏、gate 协同;P2 正式实验 = 同任务配对 + folds>0 子集 + token 成本账。
+
 ---
 
 ## 5. 已知边界与未决问题(新对话"重新优化方案"的着力点,按影响排序)
