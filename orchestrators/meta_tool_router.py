@@ -44,7 +44,12 @@ from benchmark.models import BenchmarkConfig
 from benchmark.tool_router import DEFAULT_HYBRID_ALPHA, ToolRouter
 
 from .base import AgentOrchestrator
-from .episodic_memory import Fact, extract_facts, render_recap
+from .episodic_memory import (
+    Fact,
+    extract_facts,
+    reconcile_facts,
+    render_recap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -683,17 +688,22 @@ class MetaToolOrchestrator(AgentOrchestrator):
         tool_args: Dict[str, Any],
         mcp_payload: Any,
     ) -> None:
-        """成功业务工具调用后:确定性抽取事实入库(零 LLM;只读工具结果,
-        绝不触碰 self.config.verifiers —— 与 selected_tools 同级红线)。"""
+        """成功业务工具调用后:确定性抽取事实,并经**写时协调**入库
+        (零 LLM;只读工具结果,绝不触碰 self.config.verifiers —— 与
+        selected_tools 同级红线)。
+
+        V1.1(09-09):reconcile_facts 处理同实体覆盖/去重/终态作废 ——
+        过期事实失效不删除(保审计),渲染只出有效事实 + 失效审计区。
+        """
         if not self.memory:
             return
         facts = extract_facts(
             tool_name, tool_args, mcp_payload, ts=self._mem_rounds
         )
         for f in facts:
-            self._mem_facts.append(f)
-        if len(self._mem_facts) > MEMORY_MAX_FACTS:
-            self._mem_facts = self._mem_facts[-MEMORY_MAX_FACTS:]
+            self._mem_facts = reconcile_facts(
+                self._mem_facts, f, max_facts=MEMORY_MAX_FACTS
+            )
 
     def _mem_recap_text(self) -> str:
         """由事实库渲染 recap(最新在前,超长截断)。"""
@@ -734,10 +744,11 @@ class MetaToolOrchestrator(AgentOrchestrator):
         recap = self._mem_recap_text()
         if not recap:
             return
-        # 原位替换:删 [head, end) -> 在 head 处插 recap
+        # 原位替换:删 [head, end) -> 在 head 处插 recap(recap 文本自带
+        # 护栏/Active 关键值带/失效审计区,见 episodic_memory.render_recap)
         del messages[head:end]
         recap_msg = HumanMessage(
-            content=f"[system] memory recap (earlier tool results, verified):\n{recap}"
+            content=f"[system] memory recap:\n{recap}"
         )
         messages.insert(head, recap_msg)
         # 修正剩余轮起点索引(删除 end-head 条,插入 1 条 -> 净平移 end-head-1)
@@ -797,6 +808,12 @@ class MetaToolOrchestrator(AgentOrchestrator):
         if self.memory:
             meta["mem_enabled"] = True
             meta["mem_facts"] = len(self._mem_facts)
+            meta["mem_valid_facts"] = sum(
+                1 for f in self._mem_facts if not f.invalid
+            )
+            meta["mem_invalid_facts"] = sum(
+                1 for f in self._mem_facts if f.invalid
+            )
             meta["mem_folds"] = self._mem_folds
             meta["mem_recap_chars"] = self._mem_recap_chars
             meta["mem_kept_rounds"] = self._mem_kept_rounds

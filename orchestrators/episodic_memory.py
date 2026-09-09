@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 # ---------------------------------------------------------------------------
@@ -52,6 +52,20 @@ _WRITE_VERBS = frozenset({
     "restore", "trash", "insert", "save", "post", "put", "verify",
 })
 
+# 终态(破坏性/生命周期终结)动词:命中同实体 -> 该实体全部有效事实作废
+# (失效不删除,保审计;Graphiti "superseded ≠ deleted" 语义的规则版)。
+# send 也视为终态:草稿被发出后不再以草稿状态存在。
+_DESTRUCTIVE_VERBS = frozenset({
+    "delete", "remove", "trash", "purge", "revoke", "send",
+})
+
+# recap 顶部护栏:提醒模型"早期结果可能已过期,行动前须回读"。
+_RECAP_HEADER = ("[memory recap - earlier tool results; "
+                 "may be stale - re-read before acting]")
+
+# 渲染预算:失效(审计)区最多渲染条数;总长仍受 max_chars 约束。
+_MAX_INVALID_RENDERED = 5
+
 _SCALAR_TYPES = (str, int, float, bool)
 _ENTITY_VALUE_MAX = 120      # 实体 id 值截断
 _ATTR_VALUE_MAX = 200        # 属性值截断
@@ -64,15 +78,23 @@ _ATTR_VALUE_MAX = 200        # 属性值截断
 @dataclass(frozen=True)
 class Fact:
     """一条"系统确认事实":在轮次 ts,工具 source_tool 成功返回了
-    entity 的 attribute=value。"""
+    entity 的 attribute=value。
+
+    invalid=False 表示该事实**当前有效**;invalid=True 表示已被后续写操作
+    覆盖/作废(失效不删除,保留审计 —— 支撑"曾存在/已删除"类验收)。
+    """
     entity: str
     attribute: str
     value: str
     source_tool: str
     ts: int
+    invalid: bool = False
+    invalid_reason: str = ""
 
     def render(self) -> str:
-        return f"Confirmed (from {self.source_tool}): {self.entity} {self.attribute}={self.value}"
+        tag = "Invalidated" if self.invalid else "Confirmed"
+        suffix = f" ({self.invalid_reason})" if self.invalid and self.invalid_reason else ""
+        return f"{tag} (from {self.source_tool}): {self.entity} {self.attribute}={self.value}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +207,12 @@ def _tool_has_write_verb(tool_name: str) -> bool:
     return _token_pos(tool_name, _WRITE_VERBS) >= 0
 
 
+def _is_destructive_tool(tool_name: str) -> bool:
+    """终态动词(delete/remove/trash/purge/revoke/send):命中实体 = 实体
+    生命周期终结/转移,旧状态不再为真。"""
+    return _token_pos(tool_name, _DESTRUCTIVE_VERBS) >= 0
+
+
 def _is_create_like(tool_name: str) -> bool:
     """新建类动词(create/add/insert/new):无目标实体 id,应记"返回的新 id"。"""
     return _token_pos(tool_name, frozenset(("create", "add", "insert", "new"))) >= 0
@@ -233,13 +261,122 @@ def extract_facts(
     return facts[:max_per_call]
 
 
-def render_recap(facts: Sequence[Fact], max_chars: int = 1500) -> str:
-    """把事实库渲染成单条 recap 文本(按 ts 倒序 = 最新在前),超长截断。
+def reconcile_facts(
+    facts: Sequence[Fact],
+    new_fact: Fact,
+    max_facts: int = 40,
+) -> List[Fact]:
+    """规则版"写时协调"(零 LLM;Mem0 ADD/UPDATE/DELETE 的确定性四操作子集):
 
-    全量快照语义:后折叠的 recap 覆盖旧 recap,故这里总是渲染整个 facts 序列。
+      1. **destructive**(delete/remove/trash/purge/revoke/send)命中实体
+         -> 该实体所有有效事实**失效不删除**(保审计,支撑删除型验收);
+         破坏性调用本身不产生新状态事实 -> 不 append;
+      2. 同 entity + 同 attribute + **不同值** -> 旧事实失效
+         (reason=superseded by <tool>),append 新值;
+      3. 同 entity + 同 attribute + **同值** -> 去重,不 append;
+      4. 其余(新实体/新属性/回读确认) -> append。
+
+    超限裁剪(总量 <= max_facts):**先丢最旧 invalid,再丢最旧 valid**
+    (审计区保留近期失效,有效事实优先保新)。纯函数,不改入参,返回新列表。
     """
-    ordered = sorted(facts, key=lambda f: f.ts, reverse=True)
-    lines = [f.render() for f in ordered]
+    out = list(facts)
+
+    if _is_destructive_tool(new_fact.source_tool):
+        out = [
+            replace(f, invalid=True,
+                    invalid_reason=f"{f.entity} removed/changed by "
+                                   f"{new_fact.source_tool} @ts{new_fact.ts}")
+            if (not f.invalid and f.entity == new_fact.entity) else f
+            for f in out
+        ]
+        # 破坏性结果无新状态可记(delete 成功 ≠ 实体仍存在)
+    else:
+        duplicate = any(
+            not f.invalid
+            and f.entity == new_fact.entity
+            and f.attribute == new_fact.attribute
+            and f.value == new_fact.value
+            for f in out
+        )
+        if duplicate:
+            return list(out)
+        out = [
+            replace(f, invalid=True,
+                    invalid_reason=f"superseded by {new_fact.source_tool} "
+                                   f"@ts{new_fact.ts}")
+            if (not f.invalid
+                and f.entity == new_fact.entity
+                and f.attribute == new_fact.attribute)
+            else f
+            for f in out
+        ]
+        out.append(new_fact)
+
+    # 预算裁剪:先丢最旧 invalid(审计),仍超再丢最旧 valid
+    if len(out) > max_facts:
+        overflow = len(out) - max_facts
+        invalid = sorted((f for f in out if f.invalid), key=lambda f: f.ts)
+        valid = sorted((f for f in out if not f.invalid), key=lambda f: f.ts)
+        while overflow > 0 and invalid:
+            invalid.pop(0)
+            overflow -= 1
+        while overflow > 0 and valid:
+            valid.pop(0)
+            overflow -= 1
+        out = sorted(valid + invalid, key=lambda f: f.ts)
+    return out
+
+
+def active_keys(facts: Sequence[Fact], limit: int = 8) -> str:
+    """当前有效实体的关键值带:每个实体取最新一条事实 -> 'entity (attr=value)'。
+
+    作用:折叠后模型仍需引用精确 id/状态,摘要可丢过程文本但**后续必引用值
+    显式保留**(对照 Anthropic compaction 的 ✅/❌ 清单)。
+    """
+    latest: Dict[str, Fact] = {}
+    for f in sorted((x for x in facts if not x.invalid), key=lambda x: x.ts):
+        latest[f.entity] = f          # 同 entity 保留 ts 最新
+    if not latest:
+        return ""
+    ordered = sorted(latest.values(), key=lambda x: x.ts, reverse=True)
+    seg = "; ".join(
+        f"{f.entity} ({f.attribute}={f.value})" for f in ordered[:limit]
+    )
+    return f"Active: {seg}"
+
+
+def render_recap(
+    facts: Sequence[Fact],
+    max_chars: int = 1500,
+    max_invalid_rendered: int = _MAX_INVALID_RENDERED,
+) -> str:
+    """把事实库渲染成单条 recap(整条快照语义,供原位替换旧 recap)。
+
+    分区(预算内):
+      * 顶部护栏(可能过期 + 需回读);
+      * Active 关键值带(仅有效实体);
+      * 有效事实(ts 倒序,原行格式);
+      * 失效/审计区(限量,标注原因 —— 支撑"曾存在/已删除"核对)。
+    全空 -> 返回空串(调用方据此跳过折叠)。
+    """
+    valid = sorted((f for f in facts if not f.invalid),
+                   key=lambda f: f.ts, reverse=True)
+    invalid = sorted((f for f in facts if f.invalid),
+                     key=lambda f: f.ts, reverse=True)
+    if not valid and not invalid:
+        return ""
+
+    lines = [_RECAP_HEADER]
+    ak = active_keys(facts)
+    if ak:
+        lines.append(ak)
+    lines.extend(f.render() for f in valid)
+    if invalid:
+        lines.append("-- invalidated (audit; no longer current) --")
+        lines.extend(f.render() for f in invalid[:max_invalid_rendered])
+        if len(invalid) > max_invalid_rendered:
+            lines.append(f"…({len(invalid) - max_invalid_rendered} more "
+                         "invalidated)")
     recap = "\n".join(lines)
     if len(recap) > max_chars:
         recap = recap[:max_chars] + "\n…(truncated)"
