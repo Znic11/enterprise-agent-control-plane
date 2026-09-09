@@ -176,12 +176,24 @@ V1 设计(memory_design.md)把"事实库 + recap 注入"当作安全压缩,但�
 
 ## 4. 改进设计 V2(建议;实现前先与用户对齐,按项目惯例先落盘设计)
 
+> **实施状态(09-09,用户决策:P0 暂停实验只做代码 / P1 现在全做 / 补回归测试 ✅)**
+> 已落地为 **V1.1(commit a09c4a6,单测 92/92)**:P0-2 **行为等价性回归测试**(memory=True
+> 未达 fold 阈值 → 与 memory=False 消息流逐位一致,`TestMemoryZeroDiffRegression`)、P1-4 **事实
+> 生命周期规则版**(`reconcile_facts` 写时协调:destructive 动词 delete/remove/trash/purge/revoke/send
+> 命中实体 → 有效事实失效不删除保审计、不 append 新状态;同实体同属性不同值 supersede 留痕;同值
+> 去重;预算裁剪先丢最旧 invalid 再丢最旧 valid)、P1-5 **Active 关键值带 + may-be-stale 护栏 +
+> 失效审计区**(`active_keys` 只出有效实体最新值;recap 自带 "may be stale - re-read before acting"
+> 头部;失效分区限量渲染,支撑删除型验收)。metadata 增 `mem_valid_facts`/`mem_invalid_facts`
+> (离线可看记忆库新鲜度)。未做:P0-1 折叠触发策略、P1-6 折叠单元细化(待服务端新卷)、P2 全项。
+> 服务器如需复跑:代码 git pull 后按 §0.3 命令 + 调整 fold 触发即可。
+
 ### P0 —— 先把实验跑对(检验力问题,不修这个后面都是空谈)
 1. **让折叠真的发生**:统计 email 67 任务轮次分布,把 `--memory_fold_after` 从 12 降到覆盖多数
    中长任务(如 8)或改**按 token 预算触发**(仿 Anthropic/LangGraph trigger-fraction);
    或先换到**长任务更多**的域(teams/csm/itsm)验证记忆收益,email 域作为对照保留。
 2. **行为等价性单测**:memory=True 但未达折叠阈值时,消息流必须与 memory=False **逐位一致**
    (V1 设计上满足,但缺回归测试) → 未来 A/B 才能干净归因,避免再出现"34 任务 31 个空转"说不清。
+   ✅ **已落地(V1.1 a09c4a6)**:`tests/test_episodic_memory.py::TestMemoryZeroDiffRegression`。
 3. **配对口径写进报告**:对照 = 同任务子集(57.6%),严禁拿 run_2(选择偏差子集)或全卷均值当基线。
 
 ### P1 —— 记忆机制修正(吸收 3.1/3.3/3.5/3.6)
@@ -190,12 +202,17 @@ V1 设计(memory_design.md)把"事实库 + recap 注入"当作安全压缩,但�
      命中该实体 → 旧事实标 invalid(失效而非删除,保留审计);
    - `render_recap` 只渲染当前有效事实,并可选附加"已失效实体清单(含删除时间)"以支撑删除型验收;
    - 保留 ts 单调、来源工具、max 预算 —— 与 V1 兼容。
+   ✅ **已落地(V1.1 a09c4a6)**:`reconcile_facts`(supersede/dedup/destructive 作废/预算裁剪)
+   + `Fact.invalid/invalid_reason` + recap 失效审计区(限量 + "N more invalidated" 计数)。
 5. **关键值带 + recap 护栏提示**:折叠时对"曾出现的实体 id/关键属性"建**活跃键映射**注入 recap
    首部;recap 文案显式声明 "earlier tool results (may be stale) — re-read before relying on it",
    防止模型把 recap 当权威(§2-4)。gate/checklist 生成时若引用早期实体,确保 recap 或键带可支撑
    "它曾存在/现在状态"双向核对。
+   ✅ **已落地(V1.1 a09c4a6)**:`active_keys`(仅有效实体最新值)+ recap 头部护栏
+   "[memory recap - earlier tool results; may be stale - re-read before acting]"。
 6. **折叠单元细化**:先折叠 `_tool_search` 检索往返与 schema 回喂块(噪声主源),仍超预算再折叠
    已闭环业务轮;每折叠点保留最近 N 轮原始消息(现 keep=6 保留,可保留)。
+   ⏳ **未做**:需服务端新卷验证,与 P0-1 触发策略联动设计。
 
 ### P2 —— 实验设计 V2
 7. ablation:memory-on-but-never-fold 作为第二个对照,分离"折叠压缩"与"抽取(不进上下文)"两变量;
@@ -207,9 +224,10 @@ V1 设计(memory_design.md)把"事实库 + recap 注入"当作安全压缩,但�
 
 ## 5. 下一步(建议与用户对齐项)
 1. 是否接受"当前无损伤证据、实验检验力不足"的结论(报告 §1);
-2. P0-1 折叠触发策略(fold_after 8 vs token 触发 vs 换 teams 域)选哪个先做;
-3. P1-4 事实生命周期(规则版失效/作废)是否作为 V1.1 实现;
-4. 等 run_mem 全 67 跑完后用同任务配对出正式报告再定 V2 实验。
+2. P0-1 折叠触发策略(fold_after 8 vs token 触发 vs 换 teams 域)选哪个先做 —— ⏳ **已暂停实验,
+   等代码 V1.1 审阅后由服务器新卷再验**;
+3. P1-4/P1-5 已按"P1 现在全做"落地为 V1.1(a09c4a6);P1-6 折叠单元细化待 P0-1 定策后联动;
+4. 等 run_mem 全 67 跑完后用同任务配对出正式报告再定 V2 实验 —— ✅ 已收口(§0,09-09)。
 
-*本文档由 2026-09-08 会话生成;数据源 out/email_memory/run_mem/run_1(34 files)与
-out/email_vloop/run_1(对照)本地直读。*
+*本文档由 2026-09-08 会话生成、09-09 会话补记(§0 正式全量结果 + V1.1 实施状态);数据源
+out/email_memory/run_mem/run_1(34→67 files)与 out/email_vloop/run_1(对照)本地直读。*
