@@ -1,9 +1,11 @@
-# Phase 3 记忆对照实验 诊断与正式全量结果(2026-09-08 ~ 09-09)
+# Phase 3 记忆对照实验 诊断与正式全量结果(2026-09-08 ~ 09-13)
 
 > 触发:服务端 run_mem 卷跑到 34/67(3 error,compute_score 含 err 口径 52.94%)时,用户观察到
 > "比印象中同进度 70–80% 大幅下降",怀疑记忆机制损伤成功率。
-> 本文档 = **§0 正式全量结果(09-09,run_mem 67/67)** + §1 interim 数据复盘(过程记录)+ 机制级
-> 潜在失败模式 + 外部成熟方案调研 + 改进设计 V2 建议。权威设计仍以 docs/memory_design.md 为基。
+> 本文档 = **§0 正式全量结果(09-09,run_mem 67/67)** + **§0.5 V1.1 复跑卷分析(09-13,run_mem_v11,
+> fold_after=8;含基础设施污染与生命周期零触发的代码级根因)** + §1 interim 数据复盘(过程记录)+
+> 机制级潜在失败模式 + 外部成熟方案调研 + 改进设计 V2 建议。权威设计仍以 docs/memory_design.md 为基。
+> 分析工具:`scripts/analyze_memory_runs.py`(直读 mem_* 字段;analyze_vloop_runs.py 看不到记忆字段)。
 
 ---
 
@@ -54,6 +56,86 @@
    触发 / 换 teams/csm 长任务域)。
 3. **成本初步友好**:耗时 -18%(0.82x)与"记忆零新增 LLM 调用"的设计一致方向;轮次 +23% 与
    timeout 6 个需在更可控批次复核。
+
+---
+
+## 0.5 V1.1 复跑卷(run_mem_v11,fold_after=8;2026-09-13)
+
+**一句话:折叠触发率按预期放大 3 倍(11.5% → 31.25%),但本卷被基础设施错误污染(19/67 vs
+对照 3/67),clean 56.25% 不能作为记忆效果证据;且 V1.1 的事实生命周期机制在 email 域**零触发**
+(78 次破坏性调用、0 次同实体作废),改进方向已定位到代码级根因。**
+
+### 0.5.1 卷内事实(err 19 是主噪声源)
+
+| 卷 | err | clean | success | clean 成功率 | folds 分布 | folds>0 | facts/valid/invalid | 耗时 | 轮次 |
+|---|---|---|---|---|---|---|---|---|---|
+| run_mem_v11(+V1.1, fold=8) | **19** | 48 | 27 | **56.25%** | {0:33,1:5,2:5,4:4,14:1} | **15/48=31.25%** | 1.9 / 1.9 / **0** | 1070s | 14.5 |
+| ctl(email_vloop/run_1) | 3 | 64 | 41 | 64.06% | {0:64} | 0 | — | 898s | 12.7 |
+| (参照)V1 run_mem(fold=12) | 6 | 61 | 38 | 62.30% | {0:54,1:5,2:1,6:1} | 7/61=11.5% | 2.1 / — / — | 738s | 15.6 |
+
+1. **基础设施污染(本卷不可比的主因)**:19 个 error 中 **14 个是 `upstream connect error or
+   disconnect/reset before headers. reset reason: overflow`**(网关/HTTP2 流控溢出),另 4 timeout
+   + 1 connection termination;对照卷仅 3(全 timeout)。这些 error 的 `mem_folds=0`、无执行耗时
+   → 发生在记忆生效之前,与记忆机制无关;错误率 28.3% vs 4.5% 的差异直接毁掉两卷可比性。
+2. **干净配对(46 对)**:saved **2** / regressed **5** / McNemar **p=0.4531**(未显著);且 **5 个
+   regressed 里 4 个 folds=0**(无折叠 = 与无记忆逐字节一致)→ 回归发生在记忆零作用处 = 运行噪声。
+   saved 2 中 849b4b7c 亦 folds=0(同为噪声),真正"折叠且翻转"的只有 f09e1799(saved)与
+   af32832e(regressed,§1.1 已证系检索噪声)各 1 例。
+3. **折叠触发放大(P0-1 生效)**:15/48=31.25%,约为 V1(fold=12)时 11.5% 的 **2.7 倍**;folds>0 子集
+   15 个任务成功 5(33.3%),与对照同任务配对 14 对 **saved 1 / regressed 1 / p=1.0** → 子集内仍
+   **既无损伤也无收益证据**(样本仍小)。
+4. **折叠子集成本**:rounds **19.9 vs 同任务对照 14.5(+37%)**、业务工具 **5.9 vs 7.9(-25%)**
+   → 折叠后轮次反升、工具调用下降,与"recap 信息量不足 → 模型重复检索/回读"的假设方向一致(待更
+   大样本);本卷耗时 1070s 受 error 与重跑影响,不作成本结论。
+
+### 0.5.2 V1.1 生命周期零触发:回放定位到三层根因
+
+- metadata:`mem_valid_facts == mem_facts`(均值 1.9)、**`mem_invalid_facts` 全 0**,48 个干净任务
+  无一出现失效事件。
+- **回放验证**(用真实 `extract_facts`/`reconcile_facts` 重放 `tool_results`,含 exec 分发的
+  `{name,args}` 外壳解包):78 次破坏性工具调用(delete_*/trash_*/batch_delete_*/send_message 等),
+  **0 次**找到同实体既有有效事实;回放结果与落盘 metadata 逐项一致(0 不一致)→ **代码路径忠实,非 bug**。
+- 三层根因:
+  a. **id 键白名单只认 snake_case** —— email 域全程 camelCase(`userId`/`sendAsEmail`/`messageId`/
+     `labelId`/`draftId`/`filterId`/`delegateEmail`…),`_looks_like_id_key` 一个都不命中 →
+     `send_as_alias` 全家族(list/verify/patch/get/create/delete)抽不出任何实体,78 次破坏性调用
+     中 78 次的实体抽取均失败(其中 28 次带 `sendAsEmail`)。
+  b. 大量调用只带 `userId='me'`(非实体)+ 通用键;真正的实体 id 仅出现在少数工具(args 的 `id`)。
+  c. **email 任务本身少有"同实体写→覆盖/删除"序列**:同任务内同时出现创建型+删除型的只有 label 2 个、
+     filter 2 个任务,且创建的 id 与删除的 id 互不相同。
+- **what-if 量化**(给 `_looks_like_id_key` 加 camelCase 归一化后回放):
+  | 规则 | facts 总 | valid | invalid | 有事实任务 | 有失效任务 | 实体数 |
+  |---|---|---|---|---|---|---|
+  | 现状(snake_case) | 90 | 90 | 0 | 32/48 | 0 | 89 |
+  | camelCase 归一化 | 123(+37%) | 106 | 17 | 38/48 | 10 | 69 |
+  | camelCase + 排除哨兵值(me/current/self/my) | 99 | 99 | **0** | 34/48 | **0** | 105 |
+  ⇒ 不排除哨兵时那 17 次失效**全部来自 `userId='me'` 的单桶 churn**(实体数塌缩 105→69),是伪事件;
+  排除后失效仍为 0 → **camelCase 缺口值得修(事实覆盖 +37%、recap 更实),但它不会让生命周期在
+  email 域生效**;要验证"失效不删除/终态作废"必须换有同实体状态更新的域(teams/csm/itsm)。
+
+### 0.5.3 附带发现:事实库信息量偏低
+
+48 任务仅 32 个产出事实,合计 90 条,属性只有 `confirmed`(66)与 `type`(42)两类;折叠任务
+facts 均值 3.5、recap 仅 465 字符。即**折叠用 465 字符的浅摘要替换掉了整轮工具输出**,信息密度差是
+"折叠可能有害"最合理的机制假设,与 0.5.1-4 的 rounds +37% 相互印证。
+
+### 0.5.4 小设计瑕疵(非本次结果影响,记入待修)
+
+破坏性调用仍会先合成一条 `confirmed=true` 事实(因 `delete` 在 `_WRITE_VERBS` 内),再被
+`reconcile_facts` 按终态分支丢弃 —— 语义正确但白做一次构造;可在 `extract_facts` 层对终态动词直接
+返回空(或返回"作废标记")以简化。回放示例:`delete_draft(id=draft_002)` → 合成 confirmed=true →
+reconcile 丢弃 → 该 run `mem_facts=0`,与落盘一致。
+
+### 0.5.5 处理建议
+
+1. **P0(必做)**:本卷不作证据 —— 在稳定网络/降并发下重跑 v11(或仅以 clean-clean 子集汇报,并
+   显式标注 error 率差 28.3% vs 4.5%);把 `upstream ... overflow` 纳入 error 分类脚本(现归 other)。
+2. **P1-a(代码,小改)**:id 键 camelCase 归一化 + 值级哨兵排除(`me`/`current`/`self`)+ **优先具体
+   键**(sendAsEmail/messageId/labelId/draftId/threadId/filterId/delegateEmail)于 `userId`。
+3. **P1-b(代码,小改)**:终态动词不再合成 confirmed 事实(0.5.4)。
+4. **P1-c(实验)**:先提高事实覆盖率,再评估 fold_after=8 是否过于激进 —— 当前证据显示折叠让轮次 +37%,
+   若 recap 信息密度不提升,折叠是"用信息换上下文"。
+5. **P2**:生命周期机制换域验证(teams/csm);所有报告强制按 folds 分层,单列 folds>0 配对。
 
 ---
 
