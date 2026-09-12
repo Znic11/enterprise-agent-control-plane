@@ -71,6 +71,11 @@ def load(folder: str) -> Dict[str, Dict[str, Any]]:
                 "mem_folds": int(run.get("mem_folds") or 0),
                 "mem_recap_chars": int(run.get("mem_recap_chars") or 0),
                 "mem_rounds": int(run.get("mem_rounds") or 0),
+                # ---- 行为画像(安慰剂对照用) ----
+                "search_calls": int(run.get("meta_tool_search_calls") or 0),
+                "inj_tools": len(run.get("meta_tool_injected") or []),
+                "hits_avg": float(run.get("meta_tool_hits_avg") or 0.0),
+                "cache_hits": int(run.get("meta_tool_cache_hits") or 0),
                 # ---- vl_* (Phase 2,顺带) ----
                 "vl_gate_rounds": int(run.get("vl_gate_rounds") or 0),
             }
@@ -137,6 +142,79 @@ def _mcnemar_exact_p(b: int, n: int) -> float:
     k = min(b, n - b)
     p = sum(math.comb(n, i) * (0.5 ** n) for i in range(k + 1))
     return min(1.0, 2.0 * p)
+
+
+def _sign_test(up: int, dn: int) -> float:
+    """双侧符号检验(与 McNemar 同一分布):n=up+dn 的非平局对。"""
+    n = up + dn
+    if n == 0:
+        return 1.0
+    k = min(up, dn)
+    return min(1.0, 2.0 * sum(math.comb(n, i) * (0.5 ** n)
+                              for i in range(k + 1)))
+
+
+def placebo_compare(mem: Dict[str, Dict[str, Any]],
+                    base: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """安慰剂对照(本项目最硬的一条经验):把记忆卷按 mem_folds 拆两组 ——
+
+      * **安慰剂组** folds=0:记忆层从未改写 messages(与 memory=False 逐字节一致,
+        由 TestMemoryZeroDiffRegression 锁定)→ 该组任何行为/结果差异都只能是**批次噪声**;
+      * **处理组** folds>0:折叠真的发生。
+
+    若两组的行为差(检索次数/注入工具数)量级相近,则差异来自**批次环境漂移**而非记忆;
+    报告必须据此判定"本批能否作为证据"。返回两组指标 + 符号检验 p。
+    """
+    buckets: Dict[str, List] = {"placebo_folds_eq_0": [], "treat_folds_gt_0": []}
+    for name, r in mem.items():
+        b = base.get(name)
+        if r["error"] or b is None or b["error"]:
+            continue
+        key = "treat_folds_gt_0" if r["mem_folds"] > 0 else "placebo_folds_eq_0"
+        buckets[key].append((name, r, b))
+
+    out: Dict[str, Any] = {}
+    for key, P in buckets.items():
+        if not P:
+            continue
+        s_m = sum(m["search_calls"] for _, m, _ in P)
+        s_c = sum(c["search_calls"] for _, _, c in P)
+        i_m = sum(m["inj_tools"] for _, m, _ in P)
+        i_c = sum(c["inj_tools"] for _, _, c in P)
+        up = sum(1 for _, m, c in P if m["search_calls"] > c["search_calls"])
+        dn = sum(1 for _, m, c in P if m["search_calls"] < c["search_calls"])
+        out[key] = {
+            "n": len(P),
+            "search_mem": s_m, "search_ctl": s_c,
+            "search_ratio": round(s_m / s_c, 3) if s_c else None,
+            "inj_mem": i_m, "inj_ctl": i_c,
+            "inj_ratio": round(i_m / i_c, 3) if i_c else None,
+            "success_mem": sum(1 for _, m, _ in P if m["ok"]),
+            "success_ctl": sum(1 for _, _, c in P if c["ok"]),
+            "search_up": up, "search_down": dn,
+            "sign_p": round(_sign_test(up, dn), 4),
+        }
+    return out
+
+
+def print_placebo(pc: Dict[str, Any]) -> None:
+    print("=" * 74)
+    print("② 安慰剂对照(folds=0 组 = 记忆惰性,其差异即批次噪声基线)")
+    print("=" * 74)
+    for key, v in pc.items():
+        print(f"{key}  n={v['n']}")
+        print(f"   检索 {v['search_mem']} vs {v['search_ctl']} "
+              f"({v['search_ratio']}x)  注入工具 {v['inj_mem']} vs {v['inj_ctl']} "
+              f"({v['inj_ratio']}x)  成功 {v['success_mem']} vs {v['success_ctl']}")
+        print(f"   检索升高 {v['search_up']} / 降低 {v['search_down']} 对 -> "
+              f"符号检验 p={v['sign_p']}")
+    if len(pc) == 2:
+        a, b = pc["placebo_folds_eq_0"], pc["treat_folds_gt_0"]
+        same = (a["search_ratio"] and b["search_ratio"]
+                and 0.6 <= a["search_ratio"] / b["search_ratio"] <= 1.67)
+        print("-" * 74)
+        print("   判定:" + ("两组量级相近 -> 差异属【批次环境漂移】,本批不可作记忆效果证据"
+                            if same else "两组量级差异明显 -> 折叠可能有独立效应,需复跑确认"))
 
 
 def pair_flip(base: Dict[str, Dict[str, Any]],
@@ -210,6 +288,10 @@ def main() -> None:
     ap.add_argument("--compare_dir", default=None,
                     help="另一记忆卷(如 V1 fold=12),用于折叠触发率/成本对比")
     ap.add_argument("--out", default="memory_report", help="报告前缀")
+    ap.add_argument("--placebo", action="store_true",
+                    help="安慰剂对照:按 mem_folds 拆 folds=0(记忆惰性,差异=批次噪声)"
+                         " vs folds>0(折叠真发生)两组,比较检索/注入工具/成功率"
+                         "(需 --baseline_dir)")
     args = ap.parse_args()
 
     mem = load(args.mem_dir)
@@ -234,6 +316,10 @@ def main() -> None:
         pf_sub = pair_flip(base, mem, only_names=set(sub["names"]))
         print_pair("记忆卷 vs 对照卷(folds>0 子集)", pf_sub)
         report["pairs"]["vs_baseline_folds_gt0"] = pf_sub
+        if args.placebo:
+            pc = placebo_compare(mem, base)
+            print_placebo(pc)
+            report["placebo"] = pc
 
     if args.compare_dir:
         cmp_ = load(args.compare_dir)
