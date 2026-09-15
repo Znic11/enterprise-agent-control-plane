@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
@@ -488,6 +488,7 @@ class ExecutorSubAgent:
         available_tools: List[Dict[str, Any]],
         system_prompt: str,
         working_memory: WorkingMemory,
+        execute_tool_call: Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]],
     ):
         self.subtask = subtask
         self.llm_client = llm_client
@@ -496,6 +497,7 @@ class ExecutorSubAgent:
         self.available_tools = available_tools
         self.system_prompt = system_prompt
         self.working_memory = working_memory
+        self._execute_tool_call = execute_tool_call
 
     def _generate_subtask_prompt(self) -> str:
         memory_context = self.working_memory.to_prompt_string()
@@ -593,17 +595,11 @@ Ready? Begin executing your subtask now."""
                     tool_name = tool_call["name"]
                     tool_args = tool_call["args"]
 
-                    # Route tool call to the correct MCP server
-                    target_gym = self.tool_to_server_mapping.get(
-                        tool_name, list(self.mcp_clients.keys())[0]
-                    )
-                    target_client = self.mcp_clients[target_gym]
+                    exec_result = await self._execute_tool_call(tool_name, tool_args)
+                    target_gym = exec_result["gym_server"]
+                    tool_result = exec_result["result"]
 
-                    logger.info(f"  🔧 Executing tool: {tool_name} on {target_gym}")
-
-                    tool_result = await target_client.call_tool(tool_name, tool_args)
-
-                    if tool_name not in tools_used:
+                    if exec_result.get("executed", True) and tool_name not in tools_used:
                         tools_used.append(tool_name)
 
                     tool_results.append({
@@ -611,6 +607,8 @@ Ready? Begin executing your subtask now."""
                         "arguments": tool_args,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     })
 
                     messages.append(
@@ -625,6 +623,9 @@ Ready? Begin executing your subtask now."""
                         "tool_name": tool_name,
                         "arguments": tool_args,
                         "result": tool_result,
+                        "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     })
 
             except Exception as e:
@@ -805,10 +806,11 @@ class DecomposingPlannerOrchestrator(AgentOrchestrator):
 
     def get_result_metadata(self) -> Dict[str, Any]:
         """Surface orchestration metadata and token usage in the run result."""
+        metadata = super().get_result_metadata()
         if self._orchestration_result is None:
-            return {}
+            return metadata
         result = self._orchestration_result
-        return {
+        metadata.update({
             "orchestration_metadata": {
                 "strategic_plan": result.plan,
                 "num_subtasks": len(result.subtasks),
@@ -819,7 +821,8 @@ class DecomposingPlannerOrchestrator(AgentOrchestrator):
                 "working_memory": result.working_memory,
             },
             "usage": self._build_usage_structure(result),
-        }
+        })
+        return metadata
 
     async def execute(self) -> Dict[str, Any]:
         """
@@ -886,6 +889,7 @@ class DecomposingPlannerOrchestrator(AgentOrchestrator):
                 available_tools=self.available_tools,
                 system_prompt=self.config.system_prompt,
                 working_memory=working_memory,
+                execute_tool_call=self._execute_tool_call,
             )
 
             result = await subagent.execute(max_iterations=self.max_iterations)

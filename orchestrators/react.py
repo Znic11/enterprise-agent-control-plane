@@ -88,7 +88,7 @@ class ReactOrchestrator(AgentOrchestrator):
 
                 logger.info(f"Tool result success: {tool_result.get('success')}")
 
-                if tool_name not in tools_used:
+                if exec_result.get("executed", True) and tool_name not in tools_used:
                     tools_used.append(tool_name)
 
                 tool_results.append(
@@ -97,6 +97,8 @@ class ReactOrchestrator(AgentOrchestrator):
                         "arguments": tool_args,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     }
                 )
 
@@ -113,6 +115,8 @@ class ReactOrchestrator(AgentOrchestrator):
                         "tool_name": tool_name,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     }
                 )
 

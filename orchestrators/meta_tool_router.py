@@ -253,6 +253,12 @@ class MetaToolOrchestrator(AgentOrchestrator):
         embedder:                 (测试/调用方注入用)已构造好的 TextEmbedder;
                                   为 None 时由 get_embedder(embedding_model) 提供。
         hybrid_alpha:             hybrid 融合的稠密权重(稀疏权重 = 1-alpha)。
+        dogwood_policy:           启用 Dogwood 策略门禁时的 .dw 策略路径;
+                                   None = 关闭门禁(默认,行为与旧版一致)。
+        dogwood_schema:           可选 Cedar action schema;省略时由 Dogwood
+                                   从 MCP tools/list 清单现场生成。
+        dogwood_bin:              dogwood CLI 可执行文件路径(默认 PATH 中查找)。
+        dogwood_timeout_seconds:  单次 Dogwood CLI 调用超时(默认 10 秒)。
     """
 
     def __init__(
@@ -280,6 +286,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
         memory: bool = DEFAULT_MEMORY,
         memory_fold_after: Optional[int] = None,
         memory_keep_rounds: Optional[int] = None,
+        dogwood_policy: Optional[str] = None,
+        dogwood_schema: Optional[str] = None,
+        dogwood_bin: str = "dogwood",
+        dogwood_timeout_seconds: float = 10.0,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -288,6 +298,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
             available_tools=available_tools,
             config=config,
             max_iterations=max_iterations,
+            dogwood_policy=dogwood_policy,
+            dogwood_schema=dogwood_schema,
+            dogwood_bin=dogwood_bin,
+            dogwood_timeout_seconds=dogwood_timeout_seconds,
         )
         if tool_search_top_k < 1:
             raise ValueError(f"tool_search_top_k must be >= 1, got {tool_search_top_k}")
@@ -846,7 +860,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
         """Surface Meta-Tool telemetry so experiments can audit & compute
         offline metrics (meta_tool_searches / hits_avg / cache_hits ...).
         """
-        meta: Dict[str, Any] = {
+        meta: Dict[str, Any] = super().get_result_metadata()
+        meta.update({
             "meta_tool": True,
             "meta_tool_retrieval": self.retrieval,
             "meta_tool_hybrid_alpha": self.hybrid_alpha,
@@ -863,7 +878,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
             "meta_tool_warmup_names": list(self._warmup_names),
             "meta_tool_name_repairs": len(self.name_repairs),
             "meta_tool_name_repair_detail": list(self.name_repairs[:20]),
-        }
+        })
         if self.verify_loop:
             meta["vl_enabled"] = True
             meta["vl_checklist"] = self._vl_checklist[:500]
@@ -990,6 +1005,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"] or {}
                 tool_call_id = tool_call.get("id", "")
+                execution_info: Dict[str, Any] = {
+                    "executed": False,
+                    "dogwood": None,
+                }
 
                 # 先修可能被 FC 服务端解码弄坏的包装层名,再分发
                 tool_name = self._repair_execute_wrapper_name(tool_name, tool_args)
@@ -1031,6 +1050,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
                             exec_result = await self._execute_tool_call(
                                 real_name, real_args
                             )
+                            execution_info = exec_result
                             tool_result = exec_result["result"]
                             target_gym = exec_result["gym_server"]
                             failed = _call_failed(tool_result)
@@ -1070,6 +1090,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         exec_result = await self._execute_tool_call(
                             tool_name, tool_args
                         )
+                        execution_info = exec_result
                         tool_result = exec_result["result"]
                         target_gym = exec_result["gym_server"]
                         failed = _call_failed(tool_result)
@@ -1130,6 +1151,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         "arguments": tool_args,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": execution_info.get("executed", False),
+                        "dogwood": execution_info.get("dogwood"),
                     }
                 )
 
@@ -1152,6 +1175,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         "tool_name": tool_name,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": execution_info.get("executed", False),
+                        "dogwood": execution_info.get("dogwood"),
                     }
                 )
 

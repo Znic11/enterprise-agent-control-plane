@@ -196,6 +196,8 @@ async def execute_sample(
     hybrid_alpha=0.5, tool_dispatch="inject",
     verify_loop=False, verify_max_rounds=3,
     memory=False, memory_fold_after=None, memory_keep_rounds=None,
+    dogwood_policy=None, dogwood_schema=None, dogwood_bin="dogwood",
+    dogwood_timeout_seconds=10.0,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -212,6 +214,13 @@ async def execute_sample(
 
     orchestrator_class = ORCHESTRATOR_MAP[orchestrator]
     orchestrator_kwargs = {}
+    if dogwood_policy:
+        orchestrator_kwargs.update({
+            "dogwood_policy": dogwood_policy,
+            "dogwood_schema": dogwood_schema,
+            "dogwood_bin": dogwood_bin,
+            "dogwood_timeout_seconds": dogwood_timeout_seconds,
+        })
     if planner_llm_config is not None:
         orchestrator_kwargs["planner_llm_config"] = random.choice(
             load_llm_configs(planner_llm_config)
@@ -406,6 +415,32 @@ async def main():
         help="Keep this many most recent raw rounds after folding "
              "(meta_tool + --memory only; default 6).",
     )
+    parser.add_argument(
+        "--dogwood_policy",
+        type=str,
+        default=None,
+        help="Enable the pre-execution Dogwood safety gate with this .dw policy. "
+             "The gate applies to every orchestrator and fails closed.",
+    )
+    parser.add_argument(
+        "--dogwood_schema",
+        type=str,
+        default=None,
+        help="Optional Cedar action schema. If omitted, Dogwood generates one "
+             "from the live MCP tools/list manifest.",
+    )
+    parser.add_argument(
+        "--dogwood_bin",
+        type=str,
+        default="dogwood",
+        help="Path to the official Dogwood CLI executable.",
+    )
+    parser.add_argument(
+        "--dogwood_timeout_seconds",
+        type=float,
+        default=10.0,
+        help="Timeout for each Dogwood CLI operation (default: 10 seconds).",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_folder, exist_ok=True)
@@ -479,6 +514,10 @@ async def main():
                 memory=args.memory,
                 memory_fold_after=args.memory_fold_after,
                 memory_keep_rounds=args.memory_keep_rounds,
+                dogwood_policy=args.dogwood_policy,
+                dogwood_schema=args.dogwood_schema,
+                dogwood_bin=args.dogwood_bin,
+                dogwood_timeout_seconds=args.dogwood_timeout_seconds,
             ),
             concurrency=int(args.concurrency),
         )

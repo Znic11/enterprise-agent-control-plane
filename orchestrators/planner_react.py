@@ -140,9 +140,10 @@ class PlannerReactOrchestrator(AgentOrchestrator):
 
     def get_result_metadata(self) -> Dict[str, Any]:
         """Surface the generated plan in the run result."""
+        metadata = super().get_result_metadata()
         if self._last_plan is not None:
-            return {"generated_plan": self._last_plan}
-        return {}
+            metadata["generated_plan"] = self._last_plan
+        return metadata
 
     async def execute(self) -> Dict[str, Any]:
         """
@@ -260,7 +261,7 @@ Please execute the task following the strategic plan above. Use the available to
 
                 logger.info(f"Tool result success: {tool_result.get('success')}")
 
-                if tool_name not in tools_used:
+                if exec_result.get("executed", True) and tool_name not in tools_used:
                     tools_used.append(tool_name)
 
                 tool_results.append(
@@ -269,6 +270,8 @@ Please execute the task following the strategic plan above. Use the available to
                         "arguments": tool_args,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     }
                 )
 
@@ -285,6 +288,8 @@ Please execute the task following the strategic plan above. Use the available to
                         "tool_name": tool_name,
                         "result": tool_result,
                         "gym_server": target_gym,
+                        "executed": exec_result.get("executed", True),
+                        "dogwood": exec_result.get("dogwood"),
                     }
                 )
 
