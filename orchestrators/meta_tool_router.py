@@ -98,6 +98,37 @@ def _is_read_only_tool_name(name: str) -> bool:
     return bool(toks and (toks[0] in _RO_VERBS or "_".join(toks[:2]) in _RO_VERBS))
 
 
+def _looks_like_execute_wrapper(raw_name: Any) -> bool:
+    """名字是否形似"(可能被解码器弄坏的)_execute_tool 包装层"。
+
+    dispatch=exec 下模型必须逐字复现 ``_execute_tool``。廉价/慢速 FC 服务端
+    偶发在函数名位置上多写或少写一个 token(实测:_execute_ttool / _execute_toke
+    / _execute_trap / _execute_trip / _execute_t tool ...)。判据取 "_execute_"
+    前缀,比整串编辑距离更严:既覆盖观测到的全部变体,又不会误伤任何真实工具名
+    (真实业务工具名不带该前缀)。
+    """
+    return (
+        isinstance(raw_name, str)
+        and raw_name.startswith("_execute_")
+        and raw_name != EXECUTE_TOOL_NAME
+    )
+
+
+def _call_failed(tool_result: Any) -> bool:
+    """工具调用是否失败。统一口径:success 为假 **或** isError 为真。
+
+    success=False 是框架层判定(传输失败、工具名不存在、执行异常);
+    isError=True 是 MCP 规范里工具自身的执行错误(参数校验失败、业务拒绝),
+    由 client 映射而来。任一为真即调用未生效 —— 供 verify 门禁、事实抽取、
+    tools_used 统计共用,避免各处口径不一致。
+    """
+    if not isinstance(tool_result, dict):
+        return True
+    if tool_result.get("isError") is True:
+        return True
+    return not tool_result.get("success", False)
+
+
 VL_PLANNING_PROMPT = (
     "Before performing the task, state your acceptance checklist: the concrete "
     "facts that must be true in the system when the task is complete, derived "
@@ -351,6 +382,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
         self._consecutive_zero = 0
         self._fallback_all = False
         self._warmup_names: List[str] = []
+        # 被解码器弄坏的包装层工具名的修复审计(from -> 真实工具名)
+        self.name_repairs: List[Dict[str, str]] = []
 
         if warmup_top_k is not None:
             self._warmup(warmup_top_k)
@@ -565,6 +598,34 @@ class MetaToolOrchestrator(AgentOrchestrator):
 
         return {"success": True, "result": payload, "error": None}, note
 
+    def _repair_execute_wrapper_name(self, raw_name: Any, args: Any) -> str:
+        """把被 FC 服务端解码弄坏的包装层工具名修回 ``_execute_tool``。
+
+        现象(本地历史卷实测 66 次):模型把正确的真实工具名填进了 ``args.name``,
+        却在函数名位置输出了 ``_execute_ttool`` / ``_execute_toke`` 一类的变形,
+        于是撞进"池内不存在"分支,回喂"去 _tool_search 重新找"的**误导**提示 ——
+        模型其实早已知道该调哪个工具,白白多烧检索与回合。
+
+        修复条件(两者同时满足才改判,保证只在模型意图明确时生效):
+          a) 名字带 ``_execute_`` 前缀且不等于 ``_execute_tool``(见
+             ``_looks_like_execute_wrapper``);
+          b) ``args.name`` 命中池内真实工具。
+
+        只改判**外层包装名**,内层真实工具名与参数原样透传,因此不改变任何执行
+        语义;每次修复都记一条 warn + 审计,便于后续统计该现象的残余规模。
+        """
+        if not _looks_like_execute_wrapper(raw_name):
+            return raw_name
+        inner = str((args or {}).get("name", "")).strip() if isinstance(args, dict) else ""
+        if inner and inner in self._all_tools_by_name:
+            self.name_repairs.append({"from": str(raw_name), "tool": inner})
+            logger.warning(
+                f"[META-TOOL] repaired corrupted wrapper name {raw_name!r} -> "
+                f"{EXECUTE_TOOL_NAME!r} (inner tool {inner!r})"
+            )
+            return EXECUTE_TOOL_NAME
+        return raw_name
+
     # ------------------------------------------------------------------
     # verifier-in-loop(验证闭环 V1):首轮自列 checklist + 收尾强制只读回读
     # ------------------------------------------------------------------
@@ -635,9 +696,16 @@ class MetaToolOrchestrator(AgentOrchestrator):
             f"({len(self._vl_checklist)} chars)"
         )
 
-    def _vl_note_real_tool(self, real_name: str, success: bool) -> None:
-        """gate 激活期间记录成功的只读证据(业务只读工具调用)。"""
-        if not self._vl_gate_active or not success:
+    def _vl_note_real_tool(
+        self, real_name: str, success: bool, is_error: bool = False
+    ) -> None:
+        """gate 激活期间记录**有效**的只读证据(业务只读工具调用)。
+
+        失败的回读不构成证据:success 为假或 is_error 为真一律不计入。
+        is_error 是 MCP 工具执行错误标志(参数校验失败/业务拒绝),这类调用
+        没有把系统状态读出来,计入门禁会让"无证据放行"重新出现。
+        """
+        if not self._vl_gate_active or not success or is_error:
             return
         if _is_read_only_tool_name(real_name):
             self._vl_read_calls += 1
@@ -793,6 +861,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
             "meta_tool_injected": list(self._injected),
             "meta_tool_fallback_all": bool(self._fallback_all),
             "meta_tool_warmup_names": list(self._warmup_names),
+            "meta_tool_name_repairs": len(self.name_repairs),
+            "meta_tool_name_repair_detail": list(self.name_repairs[:20]),
         }
         if self.verify_loop:
             meta["vl_enabled"] = True
@@ -921,6 +991,9 @@ class MetaToolOrchestrator(AgentOrchestrator):
                 tool_args = tool_call["args"] or {}
                 tool_call_id = tool_call.get("id", "")
 
+                # 先修可能被 FC 服务端解码弄坏的包装层名,再分发
+                tool_name = self._repair_execute_wrapper_name(tool_name, tool_args)
+
                 if tool_name == TOOL_SEARCH_NAME:
                     # 元工具:拦截 -> 检索 -> 注入可见集(只读,绝不执行真实工具)
                     tool_result, note = self._handle_tool_search(tool_args)
@@ -960,13 +1033,20 @@ class MetaToolOrchestrator(AgentOrchestrator):
                             )
                             tool_result = exec_result["result"]
                             target_gym = exec_result["gym_server"]
+                            failed = _call_failed(tool_result)
                             logger.info(
-                                f"Tool result success: {tool_result.get('success')}"
+                                f"Tool result success: {tool_result.get('success')} "
+                                f"isError: {tool_result.get('isError')}"
                             )
-                            if real_name not in tools_used:
+                            # 失败的调用不计入 tools_used(与异常路径口径一致)
+                            if not failed and real_name not in tools_used:
                                 tools_used.append(real_name)
-                            self._vl_note_real_tool(real_name, True)
-                            if tool_result.get("success", True):
+                            self._vl_note_real_tool(
+                                real_name,
+                                not failed,
+                                bool(tool_result.get("isError")),
+                            )
+                            if not failed:
                                 self._mem_note_success(
                                     real_name, real_args, tool_result.get("result")
                                 )
@@ -992,13 +1072,20 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         )
                         tool_result = exec_result["result"]
                         target_gym = exec_result["gym_server"]
+                        failed = _call_failed(tool_result)
                         logger.info(
-                            f"Tool result success: {tool_result.get('success')}"
+                            f"Tool result success: {tool_result.get('success')} "
+                            f"isError: {tool_result.get('isError')}"
                         )
-                        if tool_name not in tools_used:
+                        # 失败的调用不计入 tools_used(与异常路径口径一致)
+                        if not failed and tool_name not in tools_used:
                             tools_used.append(tool_name)
-                        self._vl_note_real_tool(tool_name, True)
-                        if tool_result.get("success", True):
+                        self._vl_note_real_tool(
+                            tool_name,
+                            not failed,
+                            bool(tool_result.get("isError")),
+                        )
+                        if not failed:
                             self._mem_note_success(
                                 tool_name, tool_args, tool_result.get("result")
                             )
@@ -1016,12 +1103,24 @@ class MetaToolOrchestrator(AgentOrchestrator):
                         f"Tool '{tool_name}' not in pool (not bindable); "
                         f"guiding model back to {TOOL_SEARCH_NAME}"
                     )
-                    tool_result = {
-                        "success": False,
-                        "error": (
+                    if _looks_like_execute_wrapper(tool_name):
+                        # 包装名被解码器弄坏、且 args.name 也没命中池内工具。
+                        # 此时提示"去检索"是误导:该修的是函数名的写法。
+                        error_msg = (
+                            f"Malformed tool name '{tool_name}'. The dispatcher "
+                            f"tool is spelled exactly '{EXECUTE_TOOL_NAME}' and "
+                            f"takes {{name, args}}, where 'name' must be an exact "
+                            f"tool name returned by {TOOL_SEARCH_NAME}. Retry with "
+                            f"the correct spelling."
+                        )
+                    else:
+                        error_msg = (
                             f"Tool '{tool_name}' does not exist in the tool pool. "
                             f"Use {TOOL_SEARCH_NAME} to discover the right tool."
-                        ),
+                        )
+                    tool_result = {
+                        "success": False,
+                        "error": error_msg,
                     }
                     target_gym = None
 
@@ -1034,10 +1133,12 @@ class MetaToolOrchestrator(AgentOrchestrator):
                     }
                 )
 
+                # 失败时回喂整个结果壳(含顶层 error 文本),让模型明确看到调用
+                # 未生效并可自纠;成功时只回喂业务载荷,避免噪音。
                 content = (
-                    tool_result.get("result", {})
-                    if tool_result.get("success", False)
-                    else tool_result
+                    tool_result
+                    if _call_failed(tool_result)
+                    else tool_result.get("result", {})
                 )
                 messages.append(
                     ToolMessage(

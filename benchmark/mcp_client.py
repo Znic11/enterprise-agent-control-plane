@@ -12,6 +12,37 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# MCP RESULT HELPERS
+# ============================================================================
+
+
+def mcp_error_text(result: Any) -> Optional[str]:
+    """从 MCP 工具结果里抽出可读的错误文本。
+
+    工具执行错误(参数校验失败、业务逻辑拒绝)按 MCP 规范承载在
+    ``result.content`` 的 text 块里,``result.isError`` 为 True。把它抽成
+    顶层字符串,模型与编排层才能在同一个字段上看到"为什么失败"。
+    """
+    if not isinstance(result, dict):
+        return None
+    parts = []
+    for part in result.get("content") or []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    text = "\n".join(p for p in parts if p.strip())
+    return text or None
+
+
+def is_tool_error(result: Any) -> bool:
+    """判断 MCP 结果是否表示工具自身执行失败(``result.isError is True``)。
+
+    HTTP 层返回 200 不代表工具调用成功:工具拒绝执行时仍是 200,失败信息
+    放在 ``result.isError``。漏判会让模型和编排层都以为调用成功。
+    """
+    return isinstance(result, dict) and result.get("isError") is True
+
+
+# ============================================================================
 # DATABASE MANAGEMENT
 # ============================================================================
 
@@ -333,10 +364,40 @@ class MCPClient:
 
         result = await self._send_request("tools/call", params, extra_headers)
         if result.get("success"):
-            data = result.get("data", {})
+            data = result.get("data", {}) or {}
+
+            # 协议级错误(工具不存在 / 请求畸形 / 服务端异常)同样以 200 返回,
+            # 只是把结果换成 error 对象。不能当成功。
+            rpc_error = data.get("error")
+            if rpc_error:
+                return {
+                    "success": False,
+                    "result": None,
+                    "error": (
+                        rpc_error
+                        if isinstance(rpc_error, str)
+                        else json.dumps(rpc_error, ensure_ascii=False)
+                    ),
+                    "isError": True,
+                }
+
+            inner = data.get("result")
+            # 工具执行错误:按 MCP 规范放在 result.isError,HTTP 层仍是 200。
+            # 必须映射到 success=False,否则模型看不到失败、无法自我修正,
+            # 编排层(verify 门禁、记忆抽取)也会把失败当成功处理。
+            tool_error = is_tool_error(inner)
             return {
-                "success": True,
-                "result": data.get("result"),
-                "error": data.get("error"),
+                "success": not tool_error,
+                "result": inner,
+                "error": mcp_error_text(inner) if tool_error else data.get("error"),
+                "isError": tool_error,
             }
-        return result
+        # 传输层失败(非 200 / 异常):统一返回形状。isError 只表达"工具自身
+        # 报了执行错误",此处失败由 success=False 承载。
+        # 判定调用失败的统一口径 = success 为假 或 isError 为真。
+        return {
+            "success": False,
+            "result": None,
+            "error": result.get("error", "MCP request failed"),
+            "isError": False,
+        }
