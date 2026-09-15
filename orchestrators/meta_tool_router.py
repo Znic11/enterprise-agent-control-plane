@@ -259,6 +259,9 @@ class MetaToolOrchestrator(AgentOrchestrator):
                                    从 MCP tools/list 清单现场生成。
         dogwood_bin:              dogwood CLI 可执行文件路径(默认 PATH 中查找)。
         dogwood_timeout_seconds:  单次 Dogwood CLI 调用超时(默认 10 秒)。
+        dogwood_tools:            生成 Cedar action schema 用的**整域工具池**
+                                   (executor 传入过滤前的全量发现结果)。
+                                   不给则退回 available_tools。
     """
 
     def __init__(
@@ -290,6 +293,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
         dogwood_schema: Optional[str] = None,
         dogwood_bin: str = "dogwood",
         dogwood_timeout_seconds: float = 10.0,
+        dogwood_tools: Optional[List[Dict[str, Any]]] = None,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -302,6 +306,7 @@ class MetaToolOrchestrator(AgentOrchestrator):
             dogwood_schema=dogwood_schema,
             dogwood_bin=dogwood_bin,
             dogwood_timeout_seconds=dogwood_timeout_seconds,
+            dogwood_tools=dogwood_tools,
         )
         if tool_search_top_k < 1:
             raise ValueError(f"tool_search_top_k must be >= 1, got {tool_search_top_k}")

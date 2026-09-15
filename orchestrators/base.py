@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from benchmark.mcp_client import MCPClient
 from benchmark.llm_client import LLMClient
@@ -27,6 +27,7 @@ class AgentOrchestrator(ABC):
         dogwood_schema: str | None = None,
         dogwood_bin: str = "dogwood",
         dogwood_timeout_seconds: float = 10.0,
+        dogwood_tools: Optional[List[Dict[str, Any]]] = None,
     ):
         self.llm_client = llm_client
         self.mcp_clients = mcp_clients
@@ -34,10 +35,18 @@ class AgentOrchestrator(ABC):
         self.available_tools = available_tools
         self.config = config
         self.max_iterations = max_iterations
+        # 生成 Cedar action schema 用的是**整域工具池**(dogwood_tools),
+        # 不是本题可见的 available_tools。理由:策略是域级产物,它的动作词表必须
+        # 覆盖整个域;而 available_tools 在 oracle / +N_tools 模式下只是本题
+        # 需要的那几个工具(实测 email 一题只有 6 个),用它生成 schema 会让策略
+        # 里引用到的其他动作变成 unrecognized action,校验失败 -> 门禁 fail-closed
+        # -> 整卷每个任务都在构造期报错。
+        # 未显式传入时退回 available_tools(兼容既有调用方与单测)。
+        self._dogwood_schema_tools = dogwood_tools or available_tools
         self._dogwood_gate = (
             DogwoodSafetyGate(
                 dogwood_policy,
-                available_tools,
+                self._dogwood_schema_tools,
                 binary=dogwood_bin,
                 schema_path=dogwood_schema,
                 timeout_seconds=dogwood_timeout_seconds,

@@ -52,6 +52,12 @@ class BenchmarkExecutor:
         self.llm_client = None
         self.verifier_engine = None
         self.available_tools = []  # Merged tools from all gyms
+        # 过滤 selected_tools **之前**的整域工具池(所有 gym 发现到的全部工具)。
+        # Dogwood 策略门禁用它生成 Cedar action schema:策略是"域级"产物,动作
+        # 词表必须是整域,而不是本题恰好看得见的那几个工具 —— 否则 oracle 模式
+        # 下 schema 只含 5~15 个动作,策略里引用到别的动作会被 Cedar 判为
+        # unrecognized action 直接拒绝(见 evaluate 的 --dogwood_policy)。
+        self.discovered_tools = []  # Full domain pool (pre-filter)
         self.tool_to_server_mapping = {}  # Maps tool_name -> gym_name
         self.gym_configs = []  # List of gym server configurations
         self.auto_created_databases = []  # Track auto-created databases for cleanup
@@ -326,6 +332,10 @@ class BenchmarkExecutor:
                 logger.error(f"Failed to discover tools from gym {gym_name}: {e}")
                 raise
 
+        # 整域池留档:策略门禁的 action schema 必须建立在"整域动作词表"上,
+        # 否则 oracle 模式的可见子集会决定策略能否通过校验。
+        self.discovered_tools = merged_tools
+
         # Filter tools based on selected_tools if configured
         if self.config.selected_tools and len(self.config.selected_tools) > 0:
             logger.info(
@@ -407,6 +417,7 @@ class BenchmarkExecutor:
             mcp_clients=self.mcp_clients,
             tool_to_server_mapping=self.tool_to_server_mapping,
             available_tools=self.available_tools,
+            dogwood_tools=self.discovered_tools or self.available_tools,
             config=self.config,
             **self.orchestrator_kwargs,
         )

@@ -113,6 +113,16 @@ def _clean_manifest(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(by_name.values())
 
 
+def build_dogwood_manifest(tools: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """公开入口:把工具清单整理成 ``dogwood schema mcp`` 能吃的 manifest。
+
+    与门禁内部生成 schema 时用的是同一个函数,保证"离线预生成 schema"与
+    "运行时自动生成 schema"的形状完全一致(否则 --dogwood_schema 与本模块
+    会各说各话)。
+    """
+    return _clean_manifest(tools)
+
+
 class DogwoodSafetyGate:
     """Fail-closed authorization gate backed by the official Dogwood CLI."""
 
@@ -125,6 +135,13 @@ class DogwoodSafetyGate:
         schema_path: Optional[str] = None,
         timeout_seconds: float = 10.0,
     ) -> None:
+        """``available_tools`` 应当是**整域工具池**,不是单任务可见子集。
+
+        策略是域级产物,动作词表必须覆盖整个域。若用单任务可见集(oracle 模式
+        实测 email 一题仅 6 个工具)生成 schema,策略里引用到的其他动作会被
+        Cedar 判为 unrecognized action,校验失败 -> fail-closed -> 整卷每个
+        任务都在构造期报错。
+        """
         self.policy_path = Path(policy_path).expanduser().resolve()
         if not self.policy_path.is_file():
             raise DogwoodConfigurationError(
