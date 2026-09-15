@@ -81,6 +81,40 @@ def collect(rows, domains):
     return picked
 
 
+# Dogwood 文档给出的 JSON -> Cedar 映射只有四种:integer->Long、string->String、
+# boolean->Bool、number+format:decimal->decimal;工具 inputSchema.properties
+# 变成 context.input,outputSchema 变成 context.output。以下关键字不在映射表里,
+# 出现在清单中就有"生成器不认识"的风险(忽略或报错取决于构建),故先数出来。
+RISKY_KEYS = ("enum", "anyOf", "oneOf", "allOf", "additionalProperties", "not")
+
+
+def audit_manifest(manifest):
+    """数一遍清单里超出文档映射表的 JSON Schema 关键字。"""
+
+    def walk(node, stat):
+        if isinstance(node, dict):
+            for key in RISKY_KEYS:
+                if key in node:
+                    stat[key] += 1
+            if "type" not in node and any(
+                key in node for key in ("properties", "items", *RISKY_KEYS)
+            ):
+                stat["no_type"] += 1
+            for value in node.values():
+                walk(value, stat)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, stat)
+
+    stat = {key: 0 for key in (*RISKY_KEYS, "no_type")}
+    for tool in manifest:
+        walk(tool.get("inputSchema") or {}, stat)
+        walk(tool.get("outputSchema") or {}, stat)
+    hits = {k: v for k, v in stat.items() if v}
+    with_output = sum(1 for t in manifest if t.get("outputSchema"))
+    return hits, with_output
+
+
 def run_cli(binary, args):
     completed = subprocess.run(
         [binary, *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -127,6 +161,13 @@ def main():
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         print(f"[{domain}] 清单 {len(manifest)} 个动作 -> {manifest_path}")
+        hits, with_output = audit_manifest(manifest)
+        if hits:
+            print(f"[{domain}] ⚠ 超出文档映射表的 JSON Schema 关键字: {hits}"
+                  f"(数量多不必然失败,但生成不出 schema 时先怀疑这里)")
+        if not with_output:
+            print(f"[{domain}] 注意:清单里 0 个工具带 outputSchema -> 生成的 schema "
+                  f"没有 context.output;引用 context.output 的策略会校验失败")
 
         if not args.dogwood_bin:
             continue

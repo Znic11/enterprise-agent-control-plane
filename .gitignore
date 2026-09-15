@@ -32,6 +32,12 @@ data/*
 # WorkBuddy session data
 .workbuddy/
 
+# Dogwood CLI binary (21MB, platform-specific; fetch/build separately) and
+# generated schema artifacts (regenerable via scripts/make_dogwood_manifest.py)
+.codex/
+policies/dogwood/*.tools.json
+policies/dogwood/*.cedarschema
+
 # OS / IDE
 .DS_Store
 .idea/

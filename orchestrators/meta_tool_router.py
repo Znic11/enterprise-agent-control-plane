@@ -262,6 +262,10 @@ class MetaToolOrchestrator(AgentOrchestrator):
         dogwood_tools:            生成 Cedar action schema 用的**整域工具池**
                                    (executor 传入过滤前的全量发现结果)。
                                    不给则退回 available_tools。
+        dogwood_principal:        trace 里的 principal 实体 UID;None = 用门禁
+                                   默认值(Drupe::OAuthUser)。CLI 模板版本不同
+                                   时实体名可能是 Drupe::User。
+        dogwood_resource:         trace 里的 resource 实体 UID;None = 默认值。
     """
 
     def __init__(
@@ -294,6 +298,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
         dogwood_bin: str = "dogwood",
         dogwood_timeout_seconds: float = 10.0,
         dogwood_tools: Optional[List[Dict[str, Any]]] = None,
+        dogwood_principal: Optional[str] = None,
+        dogwood_resource: Optional[str] = None,
     ):
         super().__init__(
             llm_client=llm_client,
@@ -307,6 +313,8 @@ class MetaToolOrchestrator(AgentOrchestrator):
             dogwood_bin=dogwood_bin,
             dogwood_timeout_seconds=dogwood_timeout_seconds,
             dogwood_tools=dogwood_tools,
+            dogwood_principal=dogwood_principal,
+            dogwood_resource=dogwood_resource,
         )
         if tool_search_top_k < 1:
             raise ValueError(f"tool_search_top_k must be >= 1, got {tool_search_top_k}")

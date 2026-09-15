@@ -28,6 +28,8 @@ class AgentOrchestrator(ABC):
         dogwood_bin: str = "dogwood",
         dogwood_timeout_seconds: float = 10.0,
         dogwood_tools: Optional[List[Dict[str, Any]]] = None,
+        dogwood_principal: Optional[str] = None,
+        dogwood_resource: Optional[str] = None,
     ):
         self.llm_client = llm_client
         self.mcp_clients = mcp_clients
@@ -43,14 +45,20 @@ class AgentOrchestrator(ABC):
         # -> 整卷每个任务都在构造期报错。
         # 未显式传入时退回 available_tools(兼容既有调用方与单测)。
         self._dogwood_schema_tools = dogwood_tools or available_tools
+        gate_kwargs: Dict[str, Any] = {
+            "binary": dogwood_bin,
+            "schema_path": dogwood_schema,
+            "timeout_seconds": dogwood_timeout_seconds,
+        }
+        # trace 里的 principal/resource 实体 UID 随 CLI 模板版本变(指南版是
+        # Drupe::OAuthUser,1.0.0 内置模板是 Drupe::User)。给策略约束 principal
+        # 的场景留一个开关,默认仍用历史值。
+        if dogwood_principal:
+            gate_kwargs["principal"] = dogwood_principal
+        if dogwood_resource:
+            gate_kwargs["resource"] = dogwood_resource
         self._dogwood_gate = (
-            DogwoodSafetyGate(
-                dogwood_policy,
-                self._dogwood_schema_tools,
-                binary=dogwood_bin,
-                schema_path=dogwood_schema,
-                timeout_seconds=dogwood_timeout_seconds,
-            )
+            DogwoodSafetyGate(dogwood_policy, self._dogwood_schema_tools, **gate_kwargs)
             if dogwood_policy
             else None
         )

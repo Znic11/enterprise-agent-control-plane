@@ -197,7 +197,7 @@ async def execute_sample(
     verify_loop=False, verify_max_rounds=3,
     memory=False, memory_fold_after=None, memory_keep_rounds=None,
     dogwood_policy=None, dogwood_schema=None, dogwood_bin="dogwood",
-    dogwood_timeout_seconds=10.0,
+    dogwood_timeout_seconds=10.0, dogwood_principal=None, dogwood_resource=None,
 ):
     if skip_sample(config_file, output_folder):
         print(f"Skipping already processed config: {config_file}")
@@ -221,6 +221,10 @@ async def execute_sample(
             "dogwood_bin": dogwood_bin,
             "dogwood_timeout_seconds": dogwood_timeout_seconds,
         })
+        if dogwood_principal:
+            orchestrator_kwargs["dogwood_principal"] = dogwood_principal
+        if dogwood_resource:
+            orchestrator_kwargs["dogwood_resource"] = dogwood_resource
     if planner_llm_config is not None:
         orchestrator_kwargs["planner_llm_config"] = random.choice(
             load_llm_configs(planner_llm_config)
@@ -427,7 +431,7 @@ async def main():
         type=str,
         default=None,
         help="Optional Cedar action schema. If omitted, Dogwood generates one "
-             "from the live MCP tools/list manifest.",
+             "from the FULL domain tool pool (all discovered gym tools).",
     )
     parser.add_argument(
         "--dogwood_bin",
@@ -440,6 +444,22 @@ async def main():
         type=float,
         default=10.0,
         help="Timeout for each Dogwood CLI operation (default: 10 seconds).",
+    )
+    parser.add_argument(
+        "--dogwood_principal",
+        type=str,
+        default=None,
+        help="Entity UID used as the trace principal, e.g. "
+             "'Drupe::User::\"agent\"'. Defaults to the gate's built-in value "
+             "(Drupe::OAuthUser::\"enterpriseops-agent\"). The entity name depends "
+             "on the Dogwood template version compiled into the CLI.",
+    )
+    parser.add_argument(
+        "--dogwood_resource",
+        type=str,
+        default=None,
+        help="Entity UID used as the trace resource. Defaults to the gate's "
+             "built-in value (Drupe::Gateway::\"enterpriseops-gym\").",
     )
     args = parser.parse_args()
 
@@ -518,6 +538,8 @@ async def main():
                 dogwood_schema=args.dogwood_schema,
                 dogwood_bin=args.dogwood_bin,
                 dogwood_timeout_seconds=args.dogwood_timeout_seconds,
+                dogwood_principal=args.dogwood_principal,
+                dogwood_resource=args.dogwood_resource,
             ),
             concurrency=int(args.concurrency),
         )

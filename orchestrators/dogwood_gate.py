@@ -24,6 +24,20 @@ class DogwoodConfigurationError(RuntimeError):
     """Raised when an enabled Dogwood gate cannot be initialized safely."""
 
 
+# trace 里 principal / resource 的实体 UID。这两个名字来自 Dogwood 的模板,而
+# 模板随 CLI 版本变:
+#   * 指南版(较新)  namespace Drupe { entity OAuthUser { id: String } tags String;
+#                                    entity Gateway; ... }
+#   * 1.0.0 (commit c6237c8 那版二进制) 内置模板是 entity User / entity Gateway,
+#     二进制里搜不到 OAuthUser 这个串。
+# 策略一般写 bare `principal`,不约束实体类型,所以不影响 validate;但 trace 里
+# 的 principal 若指向 schema 未声明的实体类型,某些构建可能在 replay 阶段报错 ->
+# fail-closed deny -> 所有工具调用被拒(任务不可达)。故做成可配置,默认值保持
+# 历史行为不变。
+DEFAULT_PRINCIPAL = 'Drupe::OAuthUser::"enterpriseops-agent"'
+DEFAULT_RESOURCE = 'Drupe::Gateway::"enterpriseops-gym"'
+
+
 @dataclass(frozen=True)
 class DogwoodDecision:
     allowed: bool
@@ -134,6 +148,8 @@ class DogwoodSafetyGate:
         binary: str = "dogwood",
         schema_path: Optional[str] = None,
         timeout_seconds: float = 10.0,
+        principal: str = DEFAULT_PRINCIPAL,
+        resource: str = DEFAULT_RESOURCE,
     ) -> None:
         """``available_tools`` 应当是**整域工具池**,不是单任务可见子集。
 
@@ -151,6 +167,12 @@ class DogwoodSafetyGate:
         self.timeout_seconds = timeout_seconds
         if timeout_seconds <= 0:
             raise DogwoodConfigurationError("Dogwood timeout must be greater than zero")
+        self.principal = str(principal).strip()
+        self.resource = str(resource).strip()
+        if not self.principal or not self.resource:
+            raise DogwoodConfigurationError(
+                "Dogwood principal and resource must be non-empty entity UIDs"
+            )
 
         self._tmp = tempfile.TemporaryDirectory(prefix="enterpriseops-dogwood-")
         self._workdir = Path(self._tmp.name)
@@ -164,6 +186,9 @@ class DogwoodSafetyGate:
         self._latency_ms = 0
         self._audit: List[Dict[str, Any]] = []
 
+        # 整域动作词表(清洗后的 MCP 清单形状)。同时用于生成 schema 与审计遥测。
+        self._schema_tools = _clean_manifest(available_tools)
+
         if schema_path:
             self.schema_path = Path(schema_path).expanduser().resolve()
             if not self.schema_path.is_file():
@@ -172,14 +197,14 @@ class DogwoodSafetyGate:
                 )
             self._generated_schema = False
         else:
-            manifest = _clean_manifest(available_tools)
-            if not manifest:
+            if not self._schema_tools:
                 raise DogwoodConfigurationError(
                     "Dogwood cannot generate an action schema from an empty tool list"
                 )
             manifest_path = self._workdir / "tools.json"
             manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(self._schema_tools, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
             self.schema_path = self._workdir / "tools.cedarschema"
             self._run(
@@ -255,8 +280,8 @@ class DogwoodSafetyGate:
     def _request_line(
         self, tool_name: str, tool_args: Dict[str, Any], request_id: str, timestamp: int
     ) -> str:
-        principal = 'Drupe::OAuthUser::"enterpriseops-agent"'
-        resource = 'Drupe::Gateway::"enterpriseops-gym"'
+        principal = self.principal
+        resource = self.resource
         input_record = _value(tool_args)
         return (
             f"@{timestamp} scope(principal: {principal}, resource: {resource}) "
@@ -348,6 +373,9 @@ class DogwoodSafetyGate:
             "policy_sha256": self.policy_sha256,
             "schema_path": str(self.schema_path),
             "schema_generated_from_mcp": self._generated_schema,
+            "principal": self.principal,
+            "resource": self.resource,
+            "action_scope_tools": len(self._schema_tools),
             "checks": self._checks,
             "allowed": self._allowed,
             "denied": self._denied,
