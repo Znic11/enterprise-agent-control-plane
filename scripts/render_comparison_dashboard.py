@@ -58,10 +58,12 @@
         description: "映射内层 isError + 修复包装名退化"
         expect_fixed: true         # 声明这卷应已带修复,没生效会告警
 
-多域一起跑就换成 `comparisons: [...]`,每组各出一张看板,再额外生成一个
-`<配置名>_index.html` 索引导航。`--init-config` 扫到多个域时会**自动按域分组** ——
-不同域的题目集合不重叠,混成一个 versions: 再比,逐题矩阵会全是空的。
-命令行参数(如 `--trajectory`)可覆盖配置里的同名项;多组模式下 `--out` 会自动
+多域一起跑就换成 `comparisons: [...]`。**多组默认合并成一个 HTML**,页面顶部有下拉框切换,
+不用开一堆文件;产物就是 `<配置名>.html` 一个(加 `<配置名>_摘要.json/.md`)。
+想还原"每组一个文件 + 索引导航页"的旧行为,加 `--split`(或配置里写 `layout: "split"`)。
+`--init-config` 扫到多个域时会**自动按域分组** —— 不同域的题目集合不重叠,
+混成一个 versions: 再比,逐题矩阵会全是空的。
+命令行参数(如 `--trajectory`)可覆盖配置里的同名项;`--split` 模式下 `--out` 会自动
 补上组名后缀,不会让各组互相覆盖。
 
 **JSON 同样支持**(扩展名用 .json 即可,且不需要 PyYAML)。YAML 需要 `pip install pyyaml`
@@ -1004,6 +1006,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .field { display: flex; flex-direction: column; gap: 4px; }
 .field label { color: var(--muted); font-size: 12px; }
 .field input, .field select { width: 100%; padding: 6px 9px; }
+.groupbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; margin: 4px 0 16px;
+  padding: 12px 14px; background: var(--surface); border: 1px solid var(--line);
+  border-left: 5px solid var(--focus); border-radius: 12px; }
+.groupbar .field { min-width: 260px; }
+.groupbar .field select { font-weight: 600; }
+.group-hint { color: var(--muted); font-size: 13px; padding-bottom: 6px; }
 .result-line { color: var(--muted); margin: 9px 0 13px; font-size: 13px; }
 .case-list { display: grid; gap: 16px; }
 .case-card { border-radius: 15px; border: 2px solid transparent; border-left-width: 9px;
@@ -1130,12 +1138,29 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-
 
 JS = r"""
 (() => {
-  const payload = JSON.parse(document.getElementById('dashboard-data').textContent);
-  const versions = payload.versions || [];
-  const tasks = payload.tasks || [];
-  const cases = payload.cases || [];
-  const pairs = payload.pairs || [];
-  const versionsByName = Object.fromEntries(versions.map(v => [v.name, v]));
+  const bundle = JSON.parse(document.getElementById('dashboard-data').textContent);
+  // 两种数据形态:单组(本体就是 payload)与多组({comparisons:[{name,payload}]},下拉框切换)
+  const groups = (Array.isArray(bundle.comparisons) && bundle.comparisons.length)
+    ? bundle.comparisons
+    : [{ name: '', description: '', domain: '', payload: bundle }];
+
+  // 当前生效的那一组;loadGroup() 负责换组时把这些引用全部换掉
+  let payload = null, versions = [], tasks = [], cases = [], pairs = [], versionsByName = {};
+  let base = null, warns = [];
+  function loadGroup(index) {
+    const at = Math.max(0, Math.min(Number(index) || 0, groups.length - 1));
+    const group = groups[at];
+    payload = group.payload || group;
+    versions = payload.versions || [];
+    tasks = payload.tasks || [];
+    cases = payload.cases || [];
+    pairs = payload.pairs || [];
+    versionsByName = Object.fromEntries(versions.map(v => [v.name, v]));
+    base = payload.baseline;
+    warns = payload.warnings || [];
+    return group;
+  }
+  loadGroup(0);
 
   // ---------- 基础工具(与原看板一致的 markdown 渲染) ----------
   const escapeHtml = (value) => String(value ?? '')
@@ -1261,20 +1286,20 @@ JS = r"""
   };
   const $ = (id) => document.getElementById(id);
 
-  document.title = payload.title;
-  $('page-title').textContent = payload.title;
-  $('page-subtitle').textContent = payload.subtitle;
-
-  // ---------- 警告 ----------
-  const warns = payload.warnings || [];
-  if (warns.length) {
-    $('warnings').innerHTML = `<div class="warnings">${warns.map(w => `<p>${escapeHtml(w)}</p>`).join('')}</div>`;
-  } else {
-    $('warnings').innerHTML = '<div class="warnings warn-ok"><p>未发现配置不一致、修复未生效或跨批不可比的告警。</p></div>';
+  // ---------- 页头与告警(每次换组都要重画) ----------
+  function renderHeader() {
+    document.title = payload.title;
+    $('page-title').textContent = payload.title;
+    $('page-subtitle').textContent = payload.subtitle;
+    $('baseline-note').textContent = `相对 ${base} 的差异`;
+    if (warns.length) {
+      $('warnings').innerHTML = `<div class="warnings">${warns.map(w => `<p>${escapeHtml(w)}</p>`).join('')}</div>`;
+    } else {
+      $('warnings').innerHTML = '<div class="warnings warn-ok"><p>未发现配置不一致、修复未生效或跨批不可比的告警。</p></div>';
+    }
   }
 
   // ---------- 版本总览表 ----------
-  const base = payload.baseline;
   function renderSummary() {
     const head = ['版本', '目录', '任务', '成功', '失败', '错误', '成功率(原始)',
       '成功率(剔错)', 'Δ vs 基线', '验证器(合并)', '验证器(cs口径)', '均值耗时', '中位耗时', '超时/错误类'];
@@ -1698,15 +1723,8 @@ JS = r"""
     $('case-section').scrollIntoView({ behavior: 'smooth' });
   }
 
-  // ---------- 交互绑定 ----------
-  function init() {
-    renderSummary(); renderPairs(); renderFix(); renderTaxonomy(); renderTelemetry();
-    // 矩阵筛选器
-    const trendOptions = [...new Set(tasks.map(t => t.trend))].sort();
-    trendOptions.forEach(t => {
-      const o = document.createElement('option'); o.value = t; o.textContent = t;
-      $('matrix-trend').appendChild(o);
-    });
+  // ---------- 交互绑定(只绑一次) ----------
+  function bindOnce() {
     $('matrix-search').addEventListener('input', e => {
       matrixState.search = e.target.value.trim().toLowerCase(); matrixState.page = 1; renderMatrix();
     });
@@ -1719,12 +1737,6 @@ JS = r"""
     $('matrix-pagesize').addEventListener('change', e => {
       matrixState.pageSize = Number(e.target.value); matrixState.page = 1; renderMatrix();
     });
-    // 案例筛选器
-    versions.forEach(v => {
-      const o = document.createElement('option'); o.value = v.name; o.textContent = v.name;
-      $('case-version').appendChild(o);
-    });
-    cases.forEach((c, i) => { c._index = i; });
     $('case-search').addEventListener('input', e => {
       caseState.search = e.target.value.trim().toLowerCase(); caseState.page = 1; renderCases();
     });
@@ -1740,12 +1752,13 @@ JS = r"""
         caseState.status = btn.dataset.cstatus; caseState.page = 1; renderCases();
       });
     });
-    // 导出按钮
+    // 导出:导的是当前选中的那一组
     $('btn-export-json').addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'comparison_payload.json';
+      a.download = groups.length > 1
+        ? `comparison_payload_${$('group-select').value}.json` : 'comparison_payload.json';
       a.click(); URL.revokeObjectURL(a.href);
     });
     $('btn-export-csv').addEventListener('click', () => {
@@ -1762,10 +1775,62 @@ JS = r"""
       a.download = 'task_version_matrix.csv';
       a.click(); URL.revokeObjectURL(a.href);
     });
-    renderMatrix();
-    renderCases();
+    // 分组下拉框(只有多组时才出现)
+    if (groups.length > 1) {
+      groups.forEach((g, i) => {
+        const o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = g.name || `分组 ${i + 1}`;
+        $('group-select').appendChild(o);
+      });
+      $('group-select').addEventListener('change', e => renderGroup(Number(e.target.value)));
+    }
   }
-  init();
+
+  // ---------- 换组:换数据引用 + 重置筛选器 + 全量重画 ----------
+  function renderGroup(index) {
+    const group = loadGroup(index);
+    renderHeader();
+
+    // 动态下拉项与筛选状态都是按组算的,换组必须重置,否则会串组
+    matrixState.search = ''; matrixState.filter = 'changed'; matrixState.trend = 'all';
+    matrixState.page = 1; matrixState.pageSize = 40;
+    $('matrix-search').value = '';
+    $('matrix-filter').value = 'changed';
+    $('matrix-pagesize').value = '40';
+    $('matrix-trend').innerHTML = '<option value="all">全部趋势</option>';
+    [...new Set(tasks.map(t => t.trend))].sort().forEach(t => {
+      const o = document.createElement('option'); o.value = t; o.textContent = t;
+      $('matrix-trend').appendChild(o);
+    });
+
+    caseState.search = ''; caseState.version = 'all'; caseState.status = 'all';
+    caseState.sort = 'status'; caseState.page = 1;
+    $('case-search').value = '';
+    $('case-sort').value = 'status';
+    $('case-version').innerHTML = '<option value="all">全部版本</option>';
+    versions.forEach(v => {
+      const o = document.createElement('option'); o.value = v.name; o.textContent = v.name;
+      $('case-version').appendChild(o);
+    });
+    document.querySelectorAll('[data-cstatus]').forEach(o =>
+      o.classList.toggle('active', o.dataset.cstatus === 'all'));
+
+    cases.forEach((c, i) => { c._index = i; });
+
+    if (groups.length > 1) {
+      $('groupbar').hidden = false;
+      $('group-select').value = String(index);
+      $('group-hint').textContent = group.description
+        || (group.domain ? `域 ${group.domain}` : '');
+    }
+
+    renderSummary(); renderPairs(); renderFix(); renderTaxonomy(); renderTelemetry();
+    renderMatrix(); renderCases();
+  }
+
+  bindOnce();
+  renderGroup(0);
 })();
 """
 
@@ -1792,7 +1857,15 @@ HTML_TEMPLATE = """<!doctype html>
 
     <div id="warnings"></div>
 
-    <h2 class="section">一、版本总览 <small>相对 __BASELINE__ 的差异</small></h2>
+    <section class="groupbar" id="groupbar" hidden>
+      <div class="field">
+        <label for="group-select">对比分组</label>
+        <select id="group-select"></select>
+      </div>
+      <span class="group-hint" id="group-hint"></span>
+    </section>
+
+    <h2 class="section">一、版本总览 <small id="baseline-note">相对 __BASELINE__ 的差异</small></h2>
     <section class="panel" id="summary-table"></section>
     <section class="panel" id="bars"></section>
 
@@ -1869,13 +1942,36 @@ def _dumps_for_html(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
 
 
-def render_html(title: str, subtitle: str, payload: Dict[str, Any]) -> str:
+def render_html(title: str, subtitle: str, payload: Dict[str, Any],
+                groups: Optional[List[Dict[str, Any]]] = None) -> str:
+    """渲染看板。
+
+    `groups` 为 None 时是单组看板(嵌一份 payload);给出 groups 时把多组一起嵌进去,
+    由前端右上方的下拉框切换 —— 这样对比多个域只需要开一个文件。
+    """
+    if groups is None:
+        data: Dict[str, Any] = payload
+        baseline_text = payload["baseline"]
+    else:
+        data = {
+            "title": title,
+            "subtitle": subtitle,
+            "generated_at": payload.get("generated_at"),
+            "noise_floor_pp": NOISE_FLOOR_PP,
+            "comparisons": [
+                {"name": g["name"], "description": g.get("description", ""),
+                 "domain": g.get("domain", ""), "payload": g["payload"]}
+                for g in groups
+            ],
+        }
+        baseline_text = f"各组自己的基线({len(groups)} 组可切换)"
+
     out = HTML_TEMPLATE
     out = out.replace("__CSS__", CSS)
     out = out.replace("__JS__", JS)
-    out = out.replace("__DATA__", _dumps_for_html(payload))
+    out = out.replace("__DATA__", _dumps_for_html(data))
     out = out.replace("__TITLE__", _html.escape(title))
-    out = out.replace("__BASELINE__", _html.escape(payload["baseline"]))
+    out = out.replace("__BASELINE__", _html.escape(baseline_text))
     return out
 
 
@@ -1925,25 +2021,36 @@ def print_summary(versions: List[Dict[str, Any]], pairs: List[Dict[str, Any]],
             print(f"  ! {note}")
 
 
-def write_report(prefix: str, payload: Dict[str, Any]) -> Tuple[str, str]:
-    """写出机器可读摘要。JSON 里剥掉完整对话轨迹(HTML 已有),
-    只留统计、配对、矩阵与案例层面的判定信息,便于二次分析。"""
-    json_path, md_path = f"{prefix}.json", f"{prefix}.md"
+def _slim_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """剥掉完整对话轨迹(HTML 里已有),只留统计、配对、矩阵与案例层面的判定信息。"""
     slim = dict(payload)
     slim["cases"] = [
         {k: v for k, v in c.items() if k != "conversation"}
         for c in payload.get("cases", [])
     ]
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(slim, f, ensure_ascii=False, indent=2)
+    return slim
 
-    versions = payload["versions"]
+
+def _report_md_lines(payload: Dict[str, Any], title_level: int = 1,
+                     with_title: bool = True) -> List[str]:
+    """一个对比组的 Markdown 片段。
+
+    合并模式里外层已经有 `## 组 N:名字` 的标题,所以 with_title=False 时省掉重复的
+    组标题,并把各级小节整体降一级(currently 用 ###)。
+    """
     base = payload["baseline"]
-    lines = [f"# {payload['title']}", "",
-             f"生成时间:{payload['generated_at']}", "",
-             f"基线:**{base}**", "", "## 版本总览", "",
-             "| 版本 | 任务 | 成功 | 失败 | 错误 | 成功率(原始) | 成功率(剔错) | 验证器(合并) | 验证器(cs口径) | Δ vs 基线 | 均值耗时 |",
-             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    versions = payload["versions"]
+    if with_title:
+        h1 = "#" * title_level
+        sec = "#" * (title_level + 1)
+        lines = [f"{h1} {payload['title']}", ""]
+    else:
+        sec = "#" * title_level
+        lines = []
+    lines += [f"生成时间:{payload['generated_at']}", "",
+              f"基线:**{base}**", "", f"{sec} 版本总览", "",
+              "| 版本 | 任务 | 成功 | 失败 | 错误 | 成功率(原始) | 成功率(剔错) | 验证器(合并) | 验证器(cs口径) | Δ vs 基线 | 均值耗时 |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     b = next(v for v in versions if v["name"] == base)
     for v in versions:
         delta = (v["success_rate_raw"] - b["success_rate_raw"]) * 100
@@ -1953,10 +2060,10 @@ def write_report(prefix: str, payload: Dict[str, Any]) -> Tuple[str, str]:
             f"{_pct(v['verifier_rate'])} | {_pct(v['cs_verifier_rate'])} | "
             f"{'—' if v['name'] == base else f'{delta:+.1f}pp'} | "
             f"{v['runtime_mean_ms'] / 1000:.0f}s |")
-    lines += ["", "## 两两配对", ""]
+    lines += ["", f"{sec} 两两配对", ""]
     for p in payload["pairs"]:
         lines += [
-            f"### {p['baseline']} → {p['variant']}",
+            f"{sec}# {p['baseline']} → {p['variant']}",
             "",
             f"- 配对 {p['paired']}:saved {p['saved']} / regressed {p['regressed']} / "
             f"both_pass {p['both_pass']} / both_fail {p['both_fail']}",
@@ -1968,7 +2075,7 @@ def write_report(prefix: str, payload: Dict[str, Any]) -> Tuple[str, str]:
         for note in p["notes"]:
             lines.append(f"- ⚠️ {note}")
         lines.append("")
-    lines += ["## 修复生效自检", "",
+    lines += [f"{sec} 修复生效自检", "",
               "| 版本 | 信封含 isError | 内层错误 | 被掩蔽 | 名修复 | 旧文案 | 新文案 | 判定 |",
               "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
     for v in versions:
@@ -1979,9 +2086,56 @@ def write_report(prefix: str, payload: Dict[str, Any]) -> Tuple[str, str]:
             f"{f.get('old_message_hits', 0)} | {f.get('new_message_hits', 0)} | "
             f"{'生效' if f.get('effective') else '未生效'} |")
     warns = payload.get("warnings") or []
-    lines += ["", "## 告警", ""]
+    lines += ["", f"{sec} 告警", ""]
     lines += [f"- {w}" for w in warns] or ["- 无"]
     lines.append("")
+    return lines
+
+
+def write_report(prefix: str, payload: Dict[str, Any]) -> Tuple[str, str]:
+    """写出机器可读摘要(单组)。"""
+    json_path, md_path = f"{prefix}.json", f"{prefix}.md"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(_slim_payload(payload), f, ensure_ascii=False, indent=2)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(_report_md_lines(payload)))
+    return json_path, md_path
+
+
+def write_combined_report(prefix: str, bundle: Dict[str, Any]) -> Tuple[str, str]:
+    """把多组对比写进同一份 JSON / Markdown(与合并看板一一对应)。"""
+    json_path, md_path = f"{prefix}.json", f"{prefix}.md"
+    slim = {
+        "title": bundle["title"],
+        "subtitle": bundle.get("subtitle", ""),
+        "generated_at": bundle["generated_at"],
+        "noise_floor_pp": bundle.get("noise_floor_pp"),
+        "comparisons": [
+            {"name": g["name"], "description": g.get("description", ""),
+             "domain": g.get("domain", ""), "payload": _slim_payload(g["payload"])}
+            for g in bundle["comparisons"]
+        ],
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(slim, f, ensure_ascii=False, indent=2)
+
+    groups = bundle["comparisons"]
+    lines = [f"# {bundle['title']}", "",
+             f"生成时间:{bundle['generated_at']}", "",
+             f"共 {len(groups)} 组对比(HTML 里用下拉框切换):", ""]
+    for i, g in enumerate(groups, 1):
+        tail = f" — {g['description']}" if g.get("description") else ""
+        dom = f"(域 {g['domain']})" if g.get("domain") else ""
+        lines.append(f"- **{i}. {g['name']}**{dom}{tail}")
+    lines.append("")
+    for i, g in enumerate(groups, 1):
+        meta = " · ".join(x for x in (
+            f"域 {g['domain']}" if g.get("domain") else "",
+            g.get("description") or "") if x)
+        lines += ["---", "", f"## 组 {i}:{g['name']}", ""]
+        if meta:
+            lines += [meta, ""]
+        lines += _report_md_lines(g["payload"], title_level=3, with_title=False)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return json_path, md_path
@@ -2071,7 +2225,8 @@ YAML_TEMPLATE_TAIL = """
 #     expect_fixed: false             # true = 这卷应该已带修复,实际没生效会告警
 #
 # ② 加一组对比(换域、或换一个话题):把顶层的 versions: 整段挪到 comparisons: 下面,
-#    写成下面这样两组,每组各出一张看板,外加一个 <本文件名>_index.html 索引导航。
+#    写成下面这样两组。**多组默认合并到一个 HTML**,页面顶部有下拉框切换,不用开一堆文件;
+#    想还原"每组一个文件 + 索引导航页"就在顶层写 layout: "split"(或命令行加 --split)。
 #    组内共用字段(name/description/domain/trajectory)写在组里,会盖过顶层的同名字段。
 #    下面这段去掉每行开头的 "#" 就能直接用:
 #
@@ -2097,6 +2252,8 @@ YAML_TEMPLATE_TAIL = """
 #   domain                  只纳入该域;留空 "" 表示不按域过滤(每个版本还能单独覆盖)
 #   trajectory              full 全量轨迹 / trim 截断(推荐) / off 不带(文件最小)
 #   trajectory_limit        trim 时单条内容的字符上限
+#   layout                  combined(默认,多组写进一个 HTML + 下拉框切换)
+#                           / split(每组一个 HTML + 索引导航页)
 #   versions[].name         看板上显示的标签,随便写中文,组内唯一
 #   versions[].dir          结果目录(含 results_*.json 的那一层,如 out/xxx/run_1)
 #   versions[].baseline     是否作为对比基线;每组只能标一个,不标则用第一个
@@ -2323,7 +2480,7 @@ def _build_specs(args: argparse.Namespace) -> Tuple[Optional[str], List[Dict[str
     """
     cli = dict(title=args.title, domain=args.domain, baseline=args.baseline,
                out=args.out, report=args.report, trajectory=args.trajectory,
-               trajectory_limit=args.trajectory_limit)
+               trajectory_limit=args.trajectory_limit, split=args.split)
 
     cfg_path = args.config
     cfg: Optional[Dict[str, Any]] = None
@@ -2417,8 +2574,16 @@ def _build_specs(args: argparse.Namespace) -> Tuple[Optional[str], List[Dict[str
                                     or blk.get("trajectory_limit") or 6000),
             "out": cli["out"] or blk.get("out") or None,
             "report": cli["report"] or blk.get("report") or None,
+            # 多组时的呈现方式:combined = 全部写进一个 HTML 用下拉框切(默认);
+            # split = 每组一个 HTML + 一个索引导航页(旧行为)
+            "layout": ("split" if cli["split"]
+                       else str(blk.get("layout") or "combined").strip().lower()),
             "expect_fixed": list(args.expect_fixed or []),
         })
+
+    for s in specs:
+        if s["layout"] not in ("combined", "split"):
+            sys.exit(f"[compare] layout 只能是 combined 或 split,收到 {s['layout']!r}")
 
     if len(specs) > 1:
         # 多组模式下 --out/--report 是给所有组共用的,**必须给每组加组名后缀**,
@@ -2429,11 +2594,13 @@ def _build_specs(args: argparse.Namespace) -> Tuple[Optional[str], List[Dict[str
         if dup:
             sys.exit(f"[compare] 多组模式下的组名重复:{dup};"
                      f"请给每个 comparisons[i].name 取唯一名字,否则产物会互相覆盖")
+        # combined 模式只有一个产物,不按组拆路径
+        split = specs[0]["layout"] == "split"
         for s in specs:
-            if cli["out"] and s["out"]:
+            if cli["out"] and s["out"] and split:
                 stem_o, ext = os.path.splitext(s["out"])
                 s["out"] = f"{stem_o}__{_slug(s['name'])}{ext}"
-            if cli["report"] and s["report"]:
+            if cli["report"] and s["report"] and split:
                 s["report"] = f"{s['report']}__{_slug(s['name'])}"
     return cfg_path, specs
 
@@ -2475,8 +2642,11 @@ def _guard_collision(cfg_path: Optional[str], out_path: str,
         sys.exit(f"[compare] 摘要路径会覆盖配置文件本身:{report_prefix}.json;请改 --report")
 
 
-def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[str, Any]:
-    """跑完一个对比:载入各版本 → 出 HTML/摘要 → 打印终端总览。"""
+def build_payload(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """载入一个对比组的各版本结果,算出看板 payload(不写盘)。
+
+    拆出来是为了让"多组写进同一个 HTML"能复用同一套计算。
+    """
     # 预检:一次性把所有配错的地方报出来,不要载入到一半才炸
     problems: List[str] = []
     for item in spec["versions"]:
@@ -2488,7 +2658,6 @@ def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[
         sys.exit("[compare] 以下版本无法载入,请检查配置:\n" + "\n".join(problems))
 
     versions: List[Dict[str, Any]] = []
-    names: List[str] = []
     for item in spec["versions"]:
         print(f"[compare] 载入 {item['name']} ← {item['dir']}"
               + (f"  [{item['description']}]" if item["description"] else ""))
@@ -2497,7 +2666,6 @@ def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[
                          description=item["description"],
                          expect_fixed=item["expect_fixed"])
         versions.append(v)
-        names.append(item["name"])
         print(f"          任务 {v['n_tasks']}(成功 {v['pass']} / 失败 {v['fail']} / "
               f"错误 {v['error']})  成功率 {_pct(v['success_rate_raw'])}")
 
@@ -2514,7 +2682,7 @@ def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[
     subtitle = spec["description"] or (
         f"基线 {baseline};共 {len(versions)} 个版本 / {len(matrix)} 个任务。"
         "对比统计、逐任务矩阵与配对显著性,并自带修复生效自检与跨批可比性守卫。")
-    payload = {
+    return {
         "title": spec["title"],
         "subtitle": subtitle,
         "generated_at": _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -2529,37 +2697,111 @@ def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[
         "warnings": warnings,
     }
 
+
+def _trajectory_note(spec: Dict[str, Any]) -> str:
+    return f"轨迹={spec['trajectory']}" + (
+        f"(上限 {spec['trajectory_limit']} 字符)" if spec["trajectory"] == "trim" else "")
+
+
+def print_run_summary(payload: Dict[str, Any]) -> None:
+    """终端总览 + 告警(单组与合并模式共用)。"""
+    print_summary(payload["versions"], payload["pairs"], payload["baseline"])
+    print("=" * 78)
+    warns = payload.get("warnings") or []
+    if warns:
+        print("告警:")
+        for w in warns:
+            print(f"  ! {w}")
+    else:
+        print("告警:无")
+    print("=" * 78)
+
+
+def run_one(spec: Dict[str, Any], cfg_path: Optional[str], multi: bool) -> Dict[str, Any]:
+    """跑完一个对比:载入各版本 → 出 HTML/摘要 → 打印终端总览。"""
+    payload = build_payload(spec)
+
     out_path, report_prefix = _default_paths(cfg_path, spec, multi)
     _guard_collision(cfg_path, out_path, report_prefix)
     out_dir = os.path.dirname(os.path.abspath(out_path))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    html_text = render_html(spec["title"], subtitle, payload)
+    html_text = render_html(spec["title"], payload["subtitle"], payload)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_text)
 
-    print_summary(versions, pairs, baseline)
-    print("=" * 78)
-    if warnings:
-        print("告警:")
-        for w in warnings:
-            print(f"  ! {w}")
-    else:
-        print("告警:无")
-    print("=" * 78)
+    print_run_summary(payload)
     print(f"看板已写:{out_path}  ({len(html_text) / 1024 / 1024:.2f} MB,"
-          f"案例 {len(all_cases)} 条,轨迹={spec['trajectory']}"
-          + (f"(上限 {spec['trajectory_limit']} 字符)" if spec["trajectory"] == "trim" else "")
-          + ")")
+          f"案例 {len(payload['cases'])} 条,{_trajectory_note(spec)})")
     reports = None
     if report_prefix:
         reports = write_report(report_prefix, payload)
         print(f"摘要已写:{reports[0]} / {reports[1]}")
     return {"name": spec["name"], "title": spec["title"],
-            "description": spec["description"], "base": baseline,
+            "description": spec["description"], "base": payload["baseline"],
             "out": out_path, "report": reports,
             "versions": [v for v in payload["versions"]],
-            "n_tasks": len(matrix), "warnings": warnings}
+            "n_tasks": len(payload["tasks"]), "warnings": payload.get("warnings") or []}
+
+
+def run_combined(specs: List[Dict[str, Any]], cfg_path: Optional[str]) -> Dict[str, Any]:
+    """把所有对比组写进**一个** HTML,靠页面上的下拉框切换。
+
+    产物名就是配置文件的名字(`out/compare.yaml` → `out/compare.html`),不再一组一个文件。
+    """
+    if not cfg_path:
+        sys.exit("[compare] 合并模式需要一个配置文件(命令行 --version 模式请改用 --split)")
+    stem = os.path.splitext(cfg_path)[0]
+    # 合并模式只有一个产物,所以整体用第一个 spec 的 out/report(命令行 > 配置顶层)
+    out_path = specs[0].get("out") or f"{stem}.html"
+    report_prefix = specs[0].get("report") or f"{stem}_摘要"
+    _guard_collision(cfg_path, out_path, report_prefix)
+    others = ({s.get("out") for s in specs[1:] if s.get("out")}
+              | {s.get("report") for s in specs[1:] if s.get("report")})
+    if others - {out_path, report_prefix}:
+        print("[compare] 注意:合并模式下所有组共用同一个产物,"
+              "各组自己写的 out/report 会被忽略(想分开请用 --split)")
+
+    groups: List[Dict[str, Any]] = []
+    for i, spec in enumerate(specs):
+        print("=" * 78)
+        print(f"对比 {i + 1}/{len(specs)}:{spec['name']}"
+              + (f"  ({spec['description']})" if spec["description"] else ""))
+        print("=" * 78)
+        payload = build_payload(spec)
+        print_run_summary(payload)
+        groups.append({"name": spec["name"], "description": spec["description"],
+                       "domain": spec.get("domain") or "", "payload": payload})
+
+    title = specs[0]["title"]
+    domains = [g["domain"] for g in groups if g["domain"]]
+    subtitle = (f"共 {len(groups)} 组对比"
+                + (f"(域:{'、'.join(sorted(set(domains)))})" if domains else "")
+                + ",用上方下拉框切换;每组各有自己的基线与版本列表。")
+    stamp = _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    html_text = render_html(title, subtitle,
+                            {"baseline": "各组基线", "generated_at": stamp},
+                            groups=groups)
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+
+    bundle = {"title": title, "subtitle": subtitle, "generated_at": stamp,
+              "noise_floor_pp": NOISE_FLOOR_PP, "comparisons": groups}
+    reports = write_combined_report(report_prefix, bundle)
+
+    cases_total = sum(len(g["payload"]["cases"]) for g in groups)
+    print("=" * 78)
+    print(f"合并看板已写:{out_path}  ({len(html_text) / 1024 / 1024:.2f} MB,"
+          f"{len(groups)} 组 / 案例 {cases_total} 条,下拉框切换)")
+    print(f"摘要已写:{reports[0]} / {reports[1]}")
+    for g in groups:
+        print(f"  - {g['name']}"
+              + (f"  域={g['domain']}" if g["domain"] else "")
+              + f"  版本 {len(g['payload']['versions'])} / 任务 {len(g['payload']['tasks'])}")
+    return {"out": out_path, "report": reports, "groups": groups}
 
 
 INDEX_TEMPLATE = """<!doctype html>
@@ -2662,6 +2904,9 @@ def main() -> None:
                     help="--trajectory trim 时单条 content/result 的字符上限")
     ap.add_argument("--expect-fixed", action="append", default=[],
                     help="期望已经带上修复的版本标签(可重复);未生效会告警")
+    ap.add_argument("--split", action="store_true",
+                    help="多组对比时每组单独出一个 HTML + 一个索引导航页"
+                         "(默认是把所有组写进同一个 HTML,用页面上的下拉框切换)")
     args = ap.parse_args()
 
     if args.init_config:
@@ -2674,7 +2919,7 @@ def main() -> None:
         groups = _group_by_domain(dirs)
         if len(groups) > 1:
             print(f"[compare] 扫到 {len(groups)} 个域,模板已按域分成 {len(groups)} 组"
-                  f"(每组一张看板 + 一个索引导航;不同域题目不重叠,混着比没意义):")
+                  f"(默认合并进同一个 HTML,用页面上的下拉框切换):")
             for gi, grp in enumerate(groups, 1):
                 print(f"          组 {gi}:域={grp['label']}  版本={len(grp['members'])}")
         print(f"[compare] 模板已写:{args.init_config}")
@@ -2686,6 +2931,12 @@ def main() -> None:
 
     cfg_path, specs = _build_specs(args)
     multi = len(specs) > 1
+
+    # 多组默认合到一个 HTML 里(下拉框切换),省得开一堆文件
+    if multi and specs[0]["layout"] == "combined":
+        run_combined(specs, cfg_path)
+        return
+
     entries: List[Dict[str, Any]] = []
     for i, spec in enumerate(specs):
         if multi:
