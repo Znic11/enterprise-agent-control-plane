@@ -828,6 +828,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "ray" },
     { name = "tabulate" },
     { name = "tqdm" },
